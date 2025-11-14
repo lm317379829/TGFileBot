@@ -231,23 +231,37 @@ func StartClient() error {
 		DisableCopyright: true,
 	}
 
-	client, err := gotgproto.NewClient(
-		int(config.ApiID),
-		config.ApiHash,
-		gotgproto.ClientTypeBot(config.BotToken),
-		clientOpts,
-	)
-	if err != nil {
-		return err
+	type ClintChan struct {
+		client *gotgproto.Client
+		err    error
 	}
 
-	Bot = client
-	log.Printf("机器人已启动: @%s\n", client.Self.Username)
+	clintChan := make(chan ClintChan, 1)
+	// 在后台执行可能阻塞的构造
+	go func() {
+		client, err := gotgproto.NewClient(
+			int(config.ApiID),
+			config.ApiHash,
+			gotgproto.ClientTypeBot(config.BotToken),
+			clientOpts,
+		)
+		clintChan <- ClintChan{client: client, err: err}
+	}()
 
-	// 加载命令处理器
-	LoadCommands(client.Dispatcher)
-
-	return nil
+	// 等待结果或超时
+	select {
+	case result := <-clintChan:
+		if result.err != nil {
+			return result.err
+		}
+		Bot = result.client
+		log.Printf("机器人已启动: @%s\n", Bot.Self.Username)
+		LoadCommands(Bot.Dispatcher)
+		return nil
+	case <-time.After(15 * time.Second):
+		// 超时：选择一 — 返回错误；或二 — 让后台继续并稍后再处理
+		return fmt.Errorf("启动客户端超时(15s)")
+	}
 }
 
 // StartUserBot 启动 User Bot 客户端，使用自定义认证流程
