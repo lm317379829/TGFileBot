@@ -836,6 +836,20 @@ This project is licensed under the [Apache 2.0](LICENSE) License.
 
 ## Changelog
 
+### v1.1.6
+- ✅ Fixed concurrent write out-of-order issues in message cache: transitioned from "lock-modify-then-publish immutable snapshot" to "**all writers perform copy-on-write and atomic swap under lock**", ensuring lock-free readers always observe a complete new or old snapshot, eliminating race conditions on underlying array modifications.
+- ✅ Fixed crash during `/phone` login when users enter non-digit characters in verification codes (e.g., `1a2b3c`): added `stripNonDigits` helper to filter out non-numeric characters before `LoginByPhone`, ensuring only pure digit strings are passed to MTProto library.
+- ✅ Improved parsing and formatting of multiple `t.me` links in `/link` command:
+    - Removed default global deduplication to allow parsing **multiple distinct links** in a single message (e.g., `t.me/c/...` and `t.me/s/...` in the same album).
+    - Call `parseTelLink` independently for each link and retain the first successful result, preventing subsequent failures from overriding previously parsed links.
+    - Corrected `formatLink` logic to ensure each link independently builds parameters and sends requests, no longer relying on global hashes (`linkHashes`) to merge results.
+- ✅ Fixed redundant processing of **private chat messages** during group management regex matching (`/parse group`, `admin`, etc.): added nil checks for `msg.MessageMediaWebPage` and `msg.MessageMediaDocument` to ensure regex matching only runs on group/channel media messages, preventing wasted computation and false positives.
+- ✅ Optimized log cleanup (`/clean`) logic to support "keep only specified ID" or "delete only specified ID" operations based on `CleanRealm` parameter:
+    - Retain only specified ID (`Keep != ""`): traverse files, compute hashes, and only delete files where `hash != Keep`.
+    - Delete only specified ID (`Keep == ""`): traverse files, compute hashes, and only delete files where `hash == Keep`.
+    - Fixed logic flaw where `Keep` and `Delete` parameters were conflated, ensuring filter logic strictly aligns with parameter intent.
+
+
 ### v1.1.5
 - ✅ Fixed multi-link extraction keeping only the last result; each link is now resolved independently
 - ✅ Stream downloads now abort with proper error logs when a chunk fails, instead of silently truncating the response per Content-Length
