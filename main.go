@@ -299,7 +299,7 @@ var infos *Infos
 var offSets *OffSets
 var startTime time.Time
 var searchCount atomic.Int64
-var version = "v1.1.6"
+var version = "v1.1.7"
 
 // main 是程序的入口函数
 func main() {
