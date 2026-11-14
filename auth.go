@@ -8,7 +8,7 @@ import (
 	"net/url"
 	"sort"
 
-	"github.com/amarnathcjd/gogram/telegram"
+	"github.com/xAmarnath/gogram/telegram"
 )
 
 // buildIDs 根据配置重建 IDs 以支持 O(1) 权限查询

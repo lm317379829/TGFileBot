@@ -4,7 +4,7 @@
 
 TGFileBot is an open-source project that deeply integrates a TeleBot and a UserBot, designed to provide high-performance direct link extraction for files, media chunk streaming, and comprehensive remote bot management features.
 
-> ⚠️ **Important Note**: This project uses a modified version of the [gogram](https://github.com/lm317379829/gogram) library.
+> ⚠️ **Important Note**: This project uses a modified version of the [gogramN](https://github.com/lm317379829/gogramN) library.
 
 **⭐ Project Features**: Adopts a production-level concurrent architecture, supports advanced features such as HTTP Range chunk streaming, automatic reference refreshing, and multi-level cache optimization.
 
@@ -83,7 +83,7 @@ Create a `config.json` file in the program's running directory or the specified 
 The program supports the following command line arguments:
 
 ```bash
-go run main.go [options]
+go run . [options]
 ```
 
 | Argument | Description |
@@ -100,18 +100,23 @@ go run main.go [options]
 Go to the [Releases](https://github.com/lm317379829/TGFileBot/releases) page, download the executable file for your system, extract it, and run it directly.
 
 **Compile and run from source**
+
+Source builds require the patched `gogramN` checkout next to this repository (`../gogramN`); its module remains `github.com/xAmarnath/gogram`. Do not use the old fork or unpatched upstream.
+
+CI: commit and push the migrated gogramN first, then set repository variable `GOGRAM_REF` to its full 40-character commit SHA. CI checks out this exact revision, not `@latest`. For a private library, provide read-only `GOGRAM_TOKEN`. This migration does not commit or push automatically.
+
 ```bash
 # Install dependencies
 go mod tidy
 
 # Run the program (default config file location: ./files/config.json)
-go run main.go
+go run .
 
 # Or specify the file directory and log path
-go run main.go -files ./files -log ./files/log.log
+go run . -files ./files -log ./files/log.log
 
 # Check version
-go run main.go -v
+go run . -v
 ```
 
 #### Docker Deployment
@@ -612,7 +617,7 @@ White (Whitelist user, basic access only)
 # Clear cache and session files
 rm -f files/user.session files/user.cache
 # Rerun the program
-go run main.go
+go run .
 ```
 
 ### Issue 2: Slow Download Speed or Frequent Timeouts

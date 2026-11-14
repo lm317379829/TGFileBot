@@ -4,7 +4,7 @@
 
 TGFileBot 是一个 TeleBot 和 UserBot 深度结合的开源项目，旨在提供高性能的文件直链提取、媒体分片流式传输以及完善的远程机器人管理功能。
 
-> ⚠️ **重要提示**: 本项目使用了修改版的 [gogram](https://github.com/lm317379829/gogram) 库。
+> ⚠️ **重要提示**: 本项目使用了修改版的 [gogramN](https://github.com/lm317379829/gogramN) 库。
 
 **⭐ 项目特色**：采用生产级并发架构，支持 HTTP Range 分片流式下载、自动引用刷新、多级缓存优化等高级特性。
 
@@ -83,7 +83,7 @@ TGFileBot 是一个 TeleBot 和 UserBot 深度结合的开源项目，旨在提�
 程序支持以下命令行参数：
 
 ```bash
-go run main.go [options]
+go run . [options]
 ```
 
 | 参数 | 说明 |
@@ -100,18 +100,23 @@ go run main.go [options]
 前往 [Releases](https://github.com/lm317379829/TGFileBot/releases) 页面，下载对应系统的可执行文件，解压后直接运行即可。
 
 **从源码编译运行**
+
+源码构建需要将包含本项目定制补丁的 `gogramN` 放在相邻目录（`../gogramN`）；模块名仍为 `github.com/xAmarnath/gogram`。不要使用旧 `gogram` 或无定制补丁的原版上游。
+
+CI：先提交并推送迁移后的 gogramN，再设置 TGFileBot 仓库变量 `GOGRAM_REF` 为该提交的完整40位 SHA；构建固定检出此提交，不使用 `@latest`。若库为私有仓库，设置具有只读权限的 `GOGRAM_TOKEN` secret。此次迁移不会自动提交或推送。
+
 ```bash
 # 安装依赖
 go mod tidy
 
 # 运行程序（默认配置文件位置: ./files/config.json）
-go run main.go
+go run .
 
 # 或指定文件目录和日志路径
-go run main.go -files ./files -log ./files/log.log
+go run . -files ./files -log ./files/log.log
 
 # 查看版本
-go run main.go -v
+go run . -v
 ```
 
 #### Docker 部署
@@ -612,7 +617,7 @@ White (白名单用户，仅基础访问)
 # 清理缓存和会话文件
 rm -f files/user.session files/user.cache
 # 重新运行程序
-go run main.go
+go run .
 ```
 
 ### 问题 2：下载速度慢或经常超时

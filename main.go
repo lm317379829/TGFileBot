@@ -19,7 +19,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/amarnathcjd/gogram/telegram"
+	"github.com/xAmarnath/gogram/telegram"
 )
 
 type Params struct {

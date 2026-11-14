@@ -36,13 +36,30 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WITH_V: false  # 不生成带v前缀的标签，如1.0.0而非v1.0.0
           
-      - name: 更新依赖
+      - name: 校验库版本
         env:
-          GOPRIVATE: github.com/lm317379829/gogram
+          GOGRAM_REF: ${{ vars.GOGRAM_REF }}
         run: |
-          go mod edit -dropreplace github.com/amarnathcjd/gogram
-          go mod edit -replace github.com/amarnathcjd/gogram=github.com/lm317379829/gogram@latest
+          if [[ ! "$GOGRAM_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::请先推送迁移后的 gogramN，并设置 GOGRAM_REF 为完整40位提交 SHA"
+            exit 1
+          fi
+
+      - name: 检出定制 gogramN
+        uses: actions/checkout@v4
+        with:
+          repository: lm317379829/gogramN
+          ref: ${{ vars.GOGRAM_REF }}
+          path: _deps/gogramN
+          token: ${{ secrets.GOGRAM_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: 更新依赖并验证
+        run: |
+          go mod edit -replace github.com/xAmarnath/gogram=./_deps/gogramN
           go mod tidy
+          go test ./...
+          go vet ./...
 
       - name: 编译
         run: |

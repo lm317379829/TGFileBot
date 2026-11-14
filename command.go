@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/amarnathcjd/gogram/telegram"
+	"github.com/xAmarnath/gogram/telegram"
 )
 
 // handleBotCommand 是 Bot 的总消息分发入口，处理所有管理指令

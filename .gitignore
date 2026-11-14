@@ -45,3 +45,6 @@ files.zip
 IDEA.md
 *test.go
 .idea
+
+# Keep migration contract regressions in the repository.
+!migration_test.go

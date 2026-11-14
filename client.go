@@ -11,7 +11,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/amarnathcjd/gogram/telegram"
+	"github.com/xAmarnath/gogram/telegram"
 )
 
 // startBot 创建并连接 Bot 客户端, 注册消息处理器并设置命令菜单
@@ -58,7 +58,7 @@ func (infos *Infos) startBot() (err error) {
 	// 启动一个协程并发设置 Bot 的命令列表, 不影响主流程
 	safeGo(func() {
 		// 先清空默认的命令列表, 确保没有权限的用户什么也看不到
-		_, err := client.SetBotCommands([]*telegram.BotCommand{}, nil)
+		_, err := client.SetBotCommands([]*telegram.BotCommand{}, botCommandScope(nil), "")
 		if err != nil {
 			log.Printf("清空默认命令失败: %+v", err)
 		}
@@ -158,7 +158,7 @@ func (infos *Infos) startBot() (err error) {
 		}
 		commands = append(commands, commonCommands...)
 
-		_, err = client.SetBotCommands(commands, &userID)
+		_, err = client.SetBotCommands(commands, botCommandScope(&userID), "")
 		if err != nil {
 			log.Printf("设置 Bot 超级管理员命令失败: %+v", err)
 			return
@@ -173,7 +173,7 @@ func (infos *Infos) startBot() (err error) {
 				log.Printf("解析用户 ID 失败: %+v", err)
 				continue
 			}
-			_, err = client.SetBotCommands(commonCommands, &userID)
+			_, err = client.SetBotCommands(commonCommands, botCommandScope(&userID), "")
 			if err != nil {
 				log.Printf("设置 Bot 管理员命令失败: %+v", err)
 				continue
@@ -374,6 +374,14 @@ func (infos *Infos) startUserBotQR() (err error) {
 					sendMS(nil, fmt.Sprintf("获取 QR 登录失败: %+v", err), nil, 60)
 				}
 				infos.resetStatus()
+				return
+			}
+
+			if qr.Url() == "" {
+				if err := infos.checkStatus(); err != nil {
+					log.Printf("UserBot 登录失败: %+v", err)
+					infos.resetStatus()
+				}
 				return
 			}
 
@@ -618,7 +626,7 @@ func (infos *Infos) wakeTCP(client *telegram.Client, cate string) error {
 }
 
 type connectClient interface {
-	Ping(context.Context) (time.Duration, error)
+	PingContext(context.Context) (time.Duration, error)
 	Disconnect() error
 	Connect() error
 }
@@ -636,7 +644,7 @@ func (infos *Infos) wakeTCPClient(client connectClient, cate string) error {
 	defer cancel()
 
 	// 最轻量探活 RPC
-	latenc, err := client.Ping(ctx)
+	latenc, err := client.PingContext(ctx)
 	if err != nil {
 		if debug {
 			log.Printf("TCP 链路异常, 正在重连: %+v", err)
@@ -658,7 +666,7 @@ func (infos *Infos) wakeTCPClient(client connectClient, cate string) error {
 			}
 			// 重连后再次验证，必须使用全新的 context，防止使用已过期的旧 context
 			newCtx, newCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			value, verr := client.Ping(newCtx)
+			value, verr := client.PingContext(newCtx)
 			newCancel()
 			if verr != nil {
 				lastErr = verr
@@ -700,7 +708,7 @@ func botConf(cate string) (conf telegram.ClientConfig) {
 			SystemVersion: "Android 14",
 			AppVersion:    "10.14.3",
 		},
-		FloodHandler: func(ctx context.Context, err error) bool {
+		FloodHandlerContext: func(ctx context.Context, err error) bool {
 			wait, _ := infos.handleFloodWait(err.Error())
 			waitDuration := floodWaitDuration(wait)
 			log.Printf("访问太过频繁, 等待 %d 秒后重试", int64(waitDuration/time.Second))
