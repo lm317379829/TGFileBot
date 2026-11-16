@@ -117,20 +117,6 @@ func handleBotCommand(m *telegram.NewMessage) error {
 					return nil
 				}
 
-				infos.Mutex.Lock()
-				value := infos.IDs[whiteID]
-				value.IsWhite = true
-				infos.IDs[whiteID] = value
-				if hash := infos.calculateHash(whiteID); hash != "" {
-					// 6 位哈希存在碰撞可能: 若该哈希已被其他 UID 占用则跳过,
-					// 避免静默覆盖导致对方哈希不可用/冒用, 与 rebuildHashIndex 的碰撞策略保持一致
-					if owner, ok := infos.HashIndex[hash]; !ok || owner == whiteID {
-						infos.HashIndex[hash] = whiteID
-					} else {
-						log.Printf("哈希碰撞, 已跳过 %d 的反查索引 (哈希 %s 归属 %d)", whiteID, hash, owner)
-					}
-				}
-				infos.Mutex.Unlock()
 				sendMS(m, fmt.Sprintf("添加白名单成功: %d", whiteID), nil, 60)
 			}
 			return nil
@@ -197,26 +183,6 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				return nil
 			}
 
-			infos.Mutex.Lock()
-			if value, ok := infos.IDs[whiteID]; ok {
-				if value.IsAdmin {
-					// 该 ID 同时也是管理员, 只清除白名单标记, 保留管理员权限（及其哈希索引）
-					value.IsWhite = false
-					infos.IDs[whiteID] = value
-				} else {
-					delete(infos.IDs, whiteID)
-					if hash := infos.calculateHash(whiteID); hash != "" {
-						// 6 位哈希存在碰撞可能: 仅当该哈希当前归属此 UID 时删除,
-						// 避免连带删除与他碰撞的其他用户的白名单哈希反查条目
-						if owner, ok := infos.HashIndex[hash]; !ok || owner == whiteID {
-							delete(infos.HashIndex, hash)
-						} else {
-							log.Printf("哈希碰撞, 跳过 %d 的反查索引删除 (哈希 %s 归属 %d)", whiteID, hash, owner)
-						}
-					}
-				}
-			}
-			infos.Mutex.Unlock()
 			sendMS(m, successMes, nil, 60)
 			return nil
 		case strings.HasPrefix(text, "/qr"):
@@ -336,7 +302,7 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				return nil
 			}
 			value, err := convertSize(content)
-			if err != nil {
+			if err != nil || value <= 0 {
 				sendMS(m, "最大缓存格式错误", nil, 60)
 				return nil
 			}
@@ -393,10 +359,6 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				sendMS(m, fmt.Sprintf("保存配置失败: %+v", err), nil, 60)
 				return nil
 			}
-			// 密码变化会改变每个 uid 对应的哈希, 需要整体重建反查表
-			infos.Mutex.Lock()
-			infos.rebuildHashIndex()
-			infos.Mutex.Unlock()
 			sendMS(m, "密码已更新", nil, 60)
 			return nil
 		case strings.HasPrefix(text, "/channel"):
@@ -437,8 +399,8 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				sendMS(m, "并发数必须为数字", nil, 60)
 				return nil
 			}
-			if num <= 0 {
-				sendMS(m, "并发数必须大于 0", nil, 60)
+			if num < 1 || num > 4 {
+				sendMS(m, "并发数必须在 1-4 之间", nil, 60)
 				return nil
 			}
 			if err := infos.refreshConf(func(c *Conf) { c.Workers = num }); err != nil {
@@ -447,9 +409,6 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				return nil
 			}
 			src := fmt.Sprintf("并发数已设置为: %d", num)
-			if num > 4 {
-				src += ", 当前并发数较大, 容易引起下载失败甚至封号, 请谨慎设置"
-			}
 			sendMS(m, src, nil, 60)
 			return nil
 		case strings.HasPrefix(text, "/check"):

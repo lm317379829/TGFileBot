@@ -5,6 +5,7 @@
   "site": "",
   "botToken": "",
   "password": "",
+  "disableLegacyHash": true,
   "userID": 0,
   "adminIDs": [],
   "whiteIDs": []

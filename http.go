@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -108,6 +109,16 @@ func handleMain(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+var errInvalidParams = errors.New("请求参数无效")
+
+func writeParamsError(w http.ResponseWriter, err error) {
+	status := http.StatusUnauthorized
+	if errors.Is(err, errInvalidParams) {
+		status = http.StatusBadRequest
+	}
+	http.Error(w, err.Error(), status)
+}
+
 // handleParams 解析流式下载请求参数
 func handleParams(r *http.Request) (result Params, err error) {
 	params := r.URL.Query()
@@ -162,16 +173,24 @@ func handleParams(r *http.Request) (result Params, err error) {
 	}
 	result.Limit = int(limit)
 
-	// ParseInt 出错时返回值已经是 0, 无需再显式判断赋值; 负值视为未提供, 避免 GetMessages 收到非法偏移
-	offset, _ := strconv.ParseInt(params.Get("offset"), 10, 32)
+	offset := int64(0)
+	if raw := params.Get("offset"); raw != "" {
+		offset, err = strconv.ParseInt(raw, 10, 32)
+		if err != nil {
+			return result, fmt.Errorf("%w: offset 必须是合法的 32 位整数", errInvalidParams)
+		}
+	}
 	if offset < 0 {
 		offset = 0
 	}
 	result.Offset = int32(offset)
 
-	cid, err := strconv.ParseInt(params.Get("cid"), 10, 64)
-	if err != nil {
-		cid = 0
+	cid := int64(0)
+	if raw := params.Get("cid"); raw != "" {
+		cid, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return result, fmt.Errorf("%w: cid 必须是合法的 64 位整数", errInvalidParams)
+		}
 	}
 	// cid 未提供或显式传 0 时都应回退到 /channel 配置的默认频道, 而不仅仅是解析成功的情形
 	if channelID := infos.Conf.Load().ChannelID; cid == 0 && channelID != 0 {
@@ -240,7 +259,7 @@ func handleRanHeader(src string, size int64) (start, end int64, status int) {
 			}
 		}
 		n, err := strconv.ParseInt(value, 10, 64)
-		return n, err == nil
+		return n, err == nil || errors.Is(err, strconv.ErrRange)
 	}
 
 	if parts[0] == "" {
@@ -301,6 +320,21 @@ func writeRanHeaders(w http.ResponseWriter, start, end, size int64, status int) 
 	w.WriteHeader(status)
 }
 
+// downloadMessageParams keeps cache identity and reference refresh tied to the
+// actual message, after resolving an alias or switching to a forwarded source.
+func downloadMessageParams(params HandleMs, src telegram.NewMessage, cate string) HandleMs {
+	if cid := src.ChannelID(); cid != 0 {
+		params.CID = cid
+	}
+	if src.ID > 0 {
+		params.MIDs = []int32{src.ID}
+	}
+	params.CNames = nil
+	params.Cate = cate
+	params.Limit = 1
+	return params
+}
+
 func handlePic(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, fmt.Sprintf("不支持的请求方法: %s", r.Method), http.StatusMethodNotAllowed)
@@ -308,7 +342,7 @@ func handlePic(w http.ResponseWriter, r *http.Request) {
 	}
 	params, err := handleParams(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
+		writeParamsError(w, err)
 		return
 	}
 	if params.CID == 0 && len(params.Channels) == 0 {
@@ -348,6 +382,7 @@ func handlePic(w http.ResponseWriter, r *http.Request) {
 	}
 
 	src := ms[0]
+	param = downloadMessageParams(param, src, cate)
 	stat := infos.connectStat(cate)
 
 	// 从媒体中查找最大的 PhotoSize
@@ -433,6 +468,9 @@ func (infos *Infos) downloadMediaR(w http.ResponseWriter, client *telegram.Clien
 		if err == nil {
 			return true
 		}
+		if (opts != nil && opts.Ctx != nil && opts.Ctx.Err() != nil) || (param.Ctx != nil && param.Ctx.Err() != nil) {
+			return false
+		}
 		switch {
 		case telegram.MatchError(err, "FILE_REFERENCE_EXPIRED"):
 			if infos.Conf.Load().DeBUG {
@@ -469,6 +507,37 @@ func (infos *Infos) downloadMediaR(w http.ResponseWriter, client *telegram.Clien
 	return false
 }
 
+func (infos *Infos) acquireSearch(ctx context.Context, maxCount int64) error {
+	if maxCount <= 0 {
+		maxCount = 3
+	}
+	stop := context.AfterFunc(ctx, func() {
+		infos.Cond.L.Lock()
+		infos.Cond.Broadcast()
+		infos.Cond.L.Unlock()
+	})
+	defer stop()
+	infos.Cond.L.Lock()
+	defer infos.Cond.L.Unlock()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if searchCount.Load() < maxCount {
+			searchCount.Add(1)
+			return nil
+		}
+		infos.Cond.Wait()
+	}
+}
+
+func (infos *Infos) releaseSearch() {
+	infos.Cond.L.Lock()
+	searchCount.Add(-1)
+	infos.Cond.Broadcast()
+	infos.Cond.L.Unlock()
+}
+
 // handleList 处理来自 HTTP 的文件列表请求
 func handleList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -477,7 +546,7 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	params, err := handleParams(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
+		writeParamsError(w, err)
 		return
 	}
 
@@ -502,21 +571,15 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 	var workerPool sync.WaitGroup
 
 	for num, channel := range params.Channels {
-		infos.Cond.L.Lock()
-		for searchCount.Load() >= maxCount {
-			infos.Cond.Wait()
+		if err := infos.acquireSearch(r.Context(), maxCount); err != nil {
+			return
 		}
-		searchCount.Add(1)
-		infos.Cond.L.Unlock()
 
 		workerPool.Add(1)
 		safeGo(func() {
 			defer func() {
+				infos.releaseSearch()
 				workerPool.Done()
-				searchCount.Add(-1)
-				infos.Cond.L.Lock()
-				infos.Cond.Broadcast()
-				infos.Cond.L.Unlock()
 			}()
 
 			// 过滤器与频道按位置一一对应（保持 /list 原有语义, 与 /search 的单值通配不同）
@@ -569,7 +632,7 @@ func handleLink(w http.ResponseWriter, r *http.Request) {
 	}
 	params, err := handleParams(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
+		writeParamsError(w, err)
 		return
 	}
 
@@ -656,7 +719,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	// 1-2. 获取 URL 参数、完成身份校验、解析频道 ID 和消息 ID
 	params, err := handleParams(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
+		writeParamsError(w, err)
 		return
 	}
 
@@ -705,7 +768,6 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	// 转发消息统一解析到源消息：让 CID/MID、文件大小/名称与媒体引用全部指向源频道,
 	// 避免大文件分支（重定向源 post）与小文件分支（直接下载转发）行为分叉,
 	// 也避免媒体缓存键（源 post）与 msCache 键（转发消息）互相错位
-	streamCID, streamMID := params.CID, params.MID
 	sourceCID, sourceMID, hasSource := forwardSource(src.Message)
 	if hasSource {
 		srcCache, err := infos.handleMs(HandleMs{
@@ -725,15 +787,20 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 			src = sm[0]
 			cate = srcCache.Cate
 			client = infos.cateClient(cate)
-			streamCID, streamMID = sourceCID, sourceMID
 		}
 	}
+	if client == nil {
+		http.Error(w, "对应客户端未就绪", http.StatusServiceUnavailable)
+		return
+	}
+	param = downloadMessageParams(param, src, cate)
+	streamCID, streamMID := param.CID, param.MIDs[0]
 	size := src.File.Size
 	fileName := src.File.Name
 	chunkSize := 1 * 1024 * 1024
 	// 整个下载分支使用同一份 Workers 快照, 避免判断分支与实际下载并发数在热重载后不一致
-	workers := infos.Conf.Load().Workers
-	if size < int64(chunkSize*workers) {
+	workers := boundedWorkers(infos.Conf.Load().Workers)
+	if size < int64(chunkSize)*int64(workers) {
 		// 与下方大文件分支保持一致的响应头, 否则浏览器/播放器只能靠内容嗅探猜测 Content-Type,
 		// 对 mkv/ts 等容器并不可靠, 下载模式也拿不到正确文件名
 		w.Header().Set("Accept-Ranges", "bytes")
@@ -805,10 +872,6 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		// 创建新的 Stream 流管理对象
-		stream := newStream(r.Context(), client, src.Media(), workers, streamMID, streamCID, src.File.Size, fileName, cate)
-		stream.Ms = ms
-
 		// 6. 设置 HTTP 响应头
 		w.Header().Set("Accept-Ranges", "bytes") // 启用 Range 支持
 		w.Header().Set("Content-Type", handleMediaCate(fileName))
@@ -843,12 +906,15 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		clientIP := handleClientIP(r)
 		log.Printf("正在处理来自 %s 的请求, 开始下载, cid=%d, mid=%d, name=%s, start=%d, end=%d", clientIP, params.CID, params.MID, fileName, start, end)
 
-		// 缓存逻辑：检查头部/尾部缓存是否命中, 并决定实际下载起点
+		// Only allocate the download queue for a valid GET range.
+		stream := newStream(r.Context(), client, src.Media(), workers, streamMID, streamCID, size, fileName, cate)
+		stream.Ms = ms
 		stream.HeadSize, stream.TailSize = mediaCacheSizes(size, stream.MaxCacheSize)
 
 		// 启动并发下载协程
 		go stream.start(start, end)
 		defer func() {
+			stream.clean()
 			if stream.Version.Load() > 0 {
 				// stream.Ms 由 stream.refresh() 在 stream.Mutex 保护下并发写入
 				// （下载协程可能在客户端已断开、本函数已经在准备 return 时仍在后台刷新引用），
@@ -867,8 +933,6 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// 异步清理：不阻塞当前请求 goroutine 返回，使新请求能立即被处理
-			safeGo(stream.clean)
 			// TCP 断开 → 立即唤醒（无论当前请求成功与否）
 			if infos.connectStat(cate).TCPDead.Load() {
 				safeGo(func() {
@@ -884,7 +948,10 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		// 10. 循环从下载管道读取分片并写入 HTTP 响应体
 		if r.Method == http.MethodGet {
 			// 首个分片给更长超时，容忍冷启动 Telegram 连接重建延迟
-			timer := time.NewTimer(streamWaitTimeout())
+			state := infos
+			queueBudget := newStreamTaskBudgetWithClock(r.Context(), streamTaskTimeout, time.Now, false, func() int64 { return state.WaitUntil.Load() })
+			defer func() { queueBudget.Close() }()
+			timer := time.NewTimer(queueBudget.Remaining())
 			defer timer.Stop()
 			for {
 				select {
@@ -902,17 +969,13 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 					// 等待任务完成或者客户端断开。
 					// 弹出任务后立刻用自适应超时重新计时：等待区间须覆盖该分片完整的
 					// 下载耗时（含重试与 FloodWait）, 否则分片仍在推进时会被误判为超时截断响应
-					timer.Reset(streamWaitTimeout())
-					select {
-					case <-r.Context().Done():
-						if infos.Conf.Load().DeBUG {
-							log.Printf("流式传输文件已取消: cid=%d, mid=%d, name=%s", params.CID, params.MID, fileName)
-						}
+					// Wait for this task using its shared worker/HTTP budget.
+					content, ok, waitErr := task.waitContent(r.Context())
+					if waitErr != nil {
+						log.Printf("等待流式分片结束: cid=%d, mid=%d, name=%s, err=%v", params.CID, params.MID, fileName, waitErr)
 						return
-					case <-timer.C:
-						log.Printf("流式传输文件超时: cid=%d, mid=%d, name=%s", params.CID, params.MID, fileName)
-						return
-					case content, ok := <-task.Content:
+					}
+					{
 						if !ok {
 							// 通道关闭有两种可能: 正常完成, 或 worker 下载失败后先设置 task.Error
 							// 再 close(task.Content)。Go 内存模型保证 close 先于"读到零值",
@@ -952,9 +1015,15 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 						}
 						task = nil
 						content = nil
-						timer.Reset(streamWaitTimeout())
+						queueBudget.Close()
+						queueBudget = newStreamTaskBudgetWithClock(r.Context(), streamTaskTimeout, time.Now, false, func() int64 { return state.WaitUntil.Load() })
+						timer.Reset(queueBudget.Remaining())
 					}
 				case <-timer.C:
+					if remaining := queueBudget.Remaining(); remaining > 0 {
+						timer.Reset(remaining)
+						continue
+					}
 					log.Printf("流式传输文件超时: cid=%d, mid=%d, name=%s", params.CID, params.MID, fileName)
 					return
 				}
@@ -973,7 +1042,7 @@ func handleSources(w http.ResponseWriter, r *http.Request) {
 
 	params, err := handleParams(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
+		writeParamsError(w, err)
 		return
 	}
 	if params.CID == 0 && len(params.Channels) == 0 {
@@ -1007,7 +1076,7 @@ func handleSources(w http.ResponseWriter, r *http.Request) {
 	}
 
 	src := resources[0]
-	ms, err := src.GetMediaGroup()
+	ms, err := src.Client.GetMediaGroupContext(r.Context(), src.Peer, src.ID)
 	if err != nil {
 		log.Printf("提取媒体组错误: %+v", err)
 		http.Error(w, err.Error(), http.StatusNotFound)
@@ -1033,6 +1102,9 @@ func handleSources(w http.ResponseWriter, r *http.Request) {
 		filter = params.Filters[0]
 	}
 	for _, m := range ms {
+		if m.File == nil {
+			continue
+		}
 		if isVideoFile(m.File.Ext) && m.File.Size < filter {
 			continue
 		}
@@ -1063,7 +1135,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	params, err := handleParams(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
+		writeParamsError(w, err)
 		return
 	}
 
@@ -1100,25 +1172,17 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	lenWords := len(words)
 	lenFilters := len(params.Filters)
 	for num, channel := range channels {
-		infos.Cond.L.Lock()
-		for searchCount.Load() >= maxCount {
-			infos.Cond.Wait()
+		if err := infos.acquireSearch(r.Context(), maxCount); err != nil {
+			return
 		}
-		// 必须在同一把锁内完成"检查未超限"与"计数加一", 否则并发的多个请求可能都通过检查后
-		// 才各自加一, 导致 searchCount 短暂超过 maxCount, 限流失效
-		searchCount.Add(1)
-		infos.Cond.L.Unlock()
 
 		workerPool.Add(1)
 		channel = strings.TrimLeft(channel, "@")
 		channel = fmt.Sprintf("@%s", channel)
 		safeGo(func() {
 			defer func() {
+				infos.releaseSearch()
 				workerPool.Done()
-				searchCount.Add(-1)
-				infos.Cond.L.Lock()
-				infos.Cond.Broadcast()
-				infos.Cond.L.Unlock()
 			}()
 
 			filter := int64(0)
@@ -1206,7 +1270,7 @@ func handleComments(w http.ResponseWriter, r *http.Request) {
 	}
 	params, err := handleParams(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
+		writeParamsError(w, err)
 		return
 	}
 	if params.MID == 0 {
@@ -1237,7 +1301,7 @@ func handleComments(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "未获取到消息", http.StatusNotFound)
 		return
 	}
-	ms, hasMore, err := infos.handleComments(params.MID, params.Offset, params.Page, params.Limit, ms)
+	ms, hasMore, err := infos.handleComments(params.MID, params.Offset, params.Page, params.Limit, ms, r.Context())
 	if err != nil {
 		http.Error(w, "获取评论失败", http.StatusInternalServerError)
 		return
@@ -1341,7 +1405,7 @@ func hackLinks(res HackLink) (items []Item, err error) {
 		cid = value
 	} else {
 		// 否则匹配的是公开频道的 username
-		channelInfo, err := infos.handleChannel(match[3])
+		channelInfo, err := infos.handleChannelContext(res.Ctx, match[3])
 		if err != nil {
 			log.Printf("获取频道 %s 信息失败: %+v", match[3], err)
 			return items, err
@@ -1361,12 +1425,14 @@ func hackLinks(res HackLink) (items []Item, err error) {
 
 	// 3. 使用 UserBot 客户端尝试获取目标消息
 	param := HandleMs{
-		CID:    cid,
-		CNames: []string{username},
-		MIDs:   []int32{mid},
-		Ctx:    res.Ctx,
-		Cate:   "user",
-		Limit:  1,
+		CID:   cid,
+		MIDs:  []int32{mid},
+		Ctx:   res.Ctx,
+		Cate:  "user",
+		Limit: 1,
+	}
+	if username != "" {
+		param.CNames = []string{username}
 	}
 
 	msCache, err := infos.handleMs(param)
@@ -1384,7 +1450,7 @@ func hackLinks(res HackLink) (items []Item, err error) {
 
 	// 4. 处理链接中的评论 (comment) 逻辑
 	if match[5] != "" {
-		ms, _, err = infos.handleComments(mid, res.Offset, 1, 0, ms)
+		ms, _, err = infos.handleComments(mid, res.Offset, 1, 0, ms, res.Ctx)
 		if err != nil {
 			log.Printf("获取评论失败: cid=%v, mid=%d, err=%+v", cid, mid, err)
 			return items, err
@@ -1393,12 +1459,21 @@ func hackLinks(res HackLink) (items []Item, err error) {
 
 	items = make([]Item, 0, len(ms))
 	for _, src := range ms {
+		if src.Message == nil || src.File == nil {
+			continue
+		}
 		if src.Message.GroupedID != 0 {
-			medias, err := src.GetMediaGroup()
+			medias, err := src.Client.GetMediaGroupContext(res.Ctx, src.Peer, src.ID)
 			if err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return nil, err
+				}
 				log.Printf("提取媒体组错误: %+v", err)
 			}
 			for _, media := range medias {
+				if media.File == nil {
+					continue
+				}
 				items = append(items, handleItem(media))
 			}
 		} else {

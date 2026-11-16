@@ -2,11 +2,14 @@ name: build TGFileBot
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
   repository_dispatch:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -14,60 +17,80 @@ concurrency:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        platform: [ubuntu-latest]
-        go-version: [ '1.26.1' ]
-    name: Build
-    runs-on: ${{ matrix.platform }}
+    name: Build and verify
+    runs-on: ubuntu-latest
     steps:
       - name: 设置 GO 环境
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ matrix.go-version }}
+          go-version: '1.26.1'
 
       - name: 检出代码
         uses: actions/checkout@v4
-        
-      - name: 检查、推送新的标签
-        id: bump
-        uses: anothrNick/github-tag-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WITH_V: false  # 不生成带v前缀的标签，如1.0.0而非v1.0.0
-          
-      - name: 校验库版本
-        env:
-          GOGRAM_REF: ${{ vars.GOGRAM_REF }}
-        run: |
-          if [[ ! "$GOGRAM_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "::error::请先推送迁移后的 gogramN，并设置 GOGRAM_REF 为完整40位提交 SHA"
-            exit 1
-          fi
+        with:
+          persist-credentials: false
 
-      - name: 检出定制 gogramN
+      - name: 检出 gogramN
         uses: actions/checkout@v4
         with:
           repository: lm317379829/gogramN
-          ref: ${{ vars.GOGRAM_REF }}
           path: _deps/gogramN
-          token: ${{ secrets.GOGRAM_TOKEN || github.token }}
           persist-credentials: false
 
       - name: 更新依赖并验证
         run: |
           go mod edit -replace github.com/xAmarnath/gogram=./_deps/gogramN
           go mod tidy
-          go test ./...
+          go test -race ./...
           go vet ./...
+          (cd _deps/gogramN && go test -race ./... && go vet ./...)
 
       - name: 编译
         run: |
-          GOOS=linux GOARCH=386 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -installsuffix netgo -o TGFileBot-linux-386
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -installsuffix netgo -o TGFileBot-linux-amd64
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -installsuffix netgo -o TGFileBot-linux-arm64
-          GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -installsuffix netgo -o TGFileBot-freebsd-amd64
-          echo ${{ steps.bump.outputs.new_tag }} >> TGFileBot-version
+          GOOS=linux GOARCH=386 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -o TGFileBot-linux-386
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -o TGFileBot-linux-amd64
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -o TGFileBot-linux-arm64
+          GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -o TGFileBot-freebsd-amd64
+
+      - name: 保存已验证构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: tgfilebot-binaries
+          path: TGFileBot-*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish verified main build
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: 检出发布文件
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 取得已验证构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: tgfilebot-binaries
+          path: .
+
+      - name: 检查、推送新的标签
+        id: bump
+        uses: anothrNick/github-tag-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WITH_V: false
+
+      - name: 写入版本说明
+        env:
+          RELEASE_TAG: ${{ steps.bump.outputs.new_tag }}
+        run: printf '%s\n' "$RELEASE_TAG" > TGFileBot-version
 
       - name: 上传至 Releases
         uses: softprops/action-gh-release@v2
@@ -75,8 +98,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ steps.bump.outputs.new_tag }}
-          files: ${{ github.workspace }}/TGFileBot-*
-      
+          files: TGFileBot-*
+
       - name: 设置 QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -84,7 +107,6 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: 登录 Docker Hub
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -98,14 +120,13 @@ jobs:
           tags: |
             type=raw,value=${{ steps.bump.outputs.new_tag }}
             type=raw,value=latest
-     
-      # 构建并推送Docker镜像
+
       - name: 构建并推送 Docker 镜像
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

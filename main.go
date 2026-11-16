@@ -275,9 +275,9 @@ type Infos struct {
 		User TCPStatu
 	} // 记录TCP连接状态
 	WakeMu struct {
-		Bot  sync.Mutex
-		User sync.Mutex
-	} // 按客户端类别串行化探活与重连, 不占用全局缓存锁
+		Bot  tcpWakeState
+		User tcpWakeState
+	} // 按客户端类别合并探活与重连, 请求可独立取消等待
 }
 
 // connectStat 按类别返回对应的 TCP 探活状态, 用于收敛调用方重复的 switch cate 判断
@@ -288,7 +288,7 @@ func (infos *Infos) connectStat(cate string) *TCPStatu {
 	return &infos.TCPStatus.Bot
 }
 
-func (infos *Infos) connectMu(cate string) *sync.Mutex {
+func (infos *Infos) connectMu(cate string) *tcpWakeState {
 	if cate == "user" {
 		return &infos.WakeMu.User
 	}
@@ -321,27 +321,20 @@ func main() {
 	// 1. 初始化全局 Infos 对象并加载配置
 	value, err := newInfos(*file, *files)
 	if err != nil {
-		log.Printf("初始化失败: %+v", err)
-		return
+		log.Fatalf("初始化失败: %+v", err)
 	}
 	infos = value
 	offSets = newOffSets()
 
 	// 2. 退出时的资源清理（延迟执行）
 	defer func() {
+		if err := closeTelegramClient(infos.BotClient.Swap(nil)); err != nil {
+			log.Printf("Bot 退出失败: %+v", err)
+		}
+		infos.stopUserClient(false)
 		if infos.File != nil {
 			if err := infos.File.Close(); err != nil {
 				log.Printf("关闭日志文件错误: %+v", err)
-			}
-		}
-		if client := infos.BotClient.Load(); client != nil {
-			if err := client.Disconnect(); err != nil {
-				log.Printf("Bot 退出失败: %+v", err)
-			}
-		}
-		if client := infos.UserClient.Load(); client != nil {
-			if err := client.Disconnect(); err != nil {
-				log.Printf("UserBot 退出失败: %+v", err)
 			}
 		}
 	}()
@@ -411,7 +404,6 @@ func main() {
 	// 8. 检查 UserBot 登录状态, 尝试自动登录（若已存在 session）
 	if err := infos.checkStatus(); err != nil {
 		log.Printf("UserBot 登录失败: %+v", err)
-		infos.resetStatus()
 	}
 
 	// 阻塞等待直到接收到退出信号
@@ -463,6 +455,15 @@ func newInfos(filePath, filesPath string) (*Infos, error) {
 		Rex:         regexp.MustCompile(`(?i)(?:FLOOD(?:_PREMIUM)?_WAIT_(\d+)|WAIT(?:\s+OF)?\s*(\d+))`),
 	}
 
+	previousLogOutput := log.Writer()
+	initialized := false
+	defer func() {
+		if !initialized && infos.File != nil {
+			_ = infos.File.Close()
+			log.SetOutput(previousLogOutput)
+		}
+	}()
+
 	// 创建日志文件
 	if filePath != "" {
 		file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -479,7 +480,7 @@ func newInfos(filePath, filesPath string) (*Infos, error) {
 	// 加载配置文件
 	conf, err := loadConf(filesPath)
 	if err != nil {
-		log.Fatalf("载入配置文件失败: %+v", err)
+		return nil, fmt.Errorf("载入配置文件失败: %w", err)
 	}
 	infos.Conf.Store(conf)
 	infos.IDs = make(map[int64]ID, len(conf.AdminIDs)+len(conf.WhiteIDs)+1)
@@ -499,6 +500,7 @@ func newInfos(filePath, filesPath string) (*Infos, error) {
 		}
 	}
 
+	initialized = true
 	return infos, nil
 }
 

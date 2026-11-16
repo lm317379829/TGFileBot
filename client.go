@@ -22,35 +22,21 @@ func (infos *Infos) startBot() (err error) {
 		cleanFiles(CleanRealm{ID: botID, Cate: "bot", Realm: "cache", Filter: true})
 	}
 
-	// 创建 Bot 客户端
-	client, err := telegram.NewClient(botConf("bot"))
+	client, err := openTelegramClient(botConf("bot"), telegram.NewClient, func(client *telegram.Client) error {
+		if err := client.Connect(); err != nil {
+			return fmt.Errorf("连接 Bot: %w", err)
+		}
+		if err := client.LoginBot(conf.BotToken); err != nil {
+			return fmt.Errorf("登录 Bot: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
-		// 清理缓存
-		cleanFiles(CleanRealm{Cate: "bot", Realm: "session"})
-		cleanFiles(CleanRealm{Cate: "bot", Realm: "cache", Filter: false})
-		log.Printf("创建 Bot 客户端失败: %+v", err)
+		log.Printf("启动 Bot 失败: %+v", err)
 		return err
 	}
 	published := false
-	defer releaseClient(client.Disconnect, &published)
-
-	// 连接 Bot
-	if err = client.Connect(); err != nil {
-		// 清理缓存
-		cleanFiles(CleanRealm{Cate: "bot", Realm: "session"})
-		cleanFiles(CleanRealm{Cate: "bot", Realm: "cache", Filter: false})
-		log.Printf("Bot 连接失败: %+v", err)
-		return err
-	}
-
-	// 登录 Bot
-	if err = client.LoginBot(conf.BotToken); err != nil {
-		// 清理缓存
-		cleanFiles(CleanRealm{Cate: "bot", Realm: "session"})
-		cleanFiles(CleanRealm{Cate: "bot", Realm: "cache", Filter: false})
-		log.Printf("Bot 登录失败: %+v", err)
-		return err
-	}
+	defer releaseClient(func() error { return closeTelegramClient(client) }, &published)
 
 	// 注册 Bot 命令处理函数
 	client.On(telegram.OnMessage, handleBotCommand)
@@ -210,22 +196,12 @@ func (infos *Infos) userBotClient() (err error) {
 		clientConf.DataCenter = appConf.DC
 	}
 
-	client, err := telegram.NewClient(clientConf)
+	client, err := openTelegramClient(clientConf, telegram.NewClient, func(client *telegram.Client) error {
+		return client.Connect()
+	})
 	if err != nil {
-		// 清理缓存
-		cleanFiles(CleanRealm{Cate: "user", Realm: "session"})
-		cleanFiles(CleanRealm{Cate: "user", Realm: "cache", Filter: false})
-		log.Printf("创建 UserBot 客户端失败: %+v", err)
-		return
-	}
-
-	// 连接 UserBot
-	if err = client.Connect(); err != nil {
-		// 清理缓存
-		cleanFiles(CleanRealm{Cate: "user", Realm: "session"})
-		cleanFiles(CleanRealm{Cate: "user", Realm: "cache", Filter: false})
-		log.Printf("UserBot 连接失败: %+v", err)
-		return
+		log.Printf("创建或连接 UserBot 失败: %+v", err)
+		return err
 	}
 
 	infos.UserClient.Store(client)
@@ -256,7 +232,7 @@ func (infos *Infos) startUserBot(phone string) (err error) {
 		if infos.UserClient.Load() == nil {
 			if err := infos.userBotClient(); err != nil {
 				log.Printf("UserBot 登录失败: %+v", err)
-				infos.resetStatus()
+				infos.stopUserClient(false)
 				return err
 			}
 		}
@@ -266,7 +242,7 @@ func (infos *Infos) startUserBot(phone string) (err error) {
 		if infos.UserClient.Load() == nil {
 			if err := infos.userBotClient(); err != nil {
 				log.Printf("UserBot 登录失败: %+v", err)
-				infos.resetStatus()
+				infos.stopUserClient(false)
 				infos.LoMu.Unlock()
 				return err
 			}
@@ -285,7 +261,7 @@ func (infos *Infos) startUserBot(phone string) (err error) {
 			if err != nil {
 				log.Printf("UserBot 登录失败: %+v", err)
 				sendMS(nil, fmt.Sprintf("UserBot 登录失败: %+v", err), nil, 60)
-				infos.resetStatus()
+				infos.stopUserClient(false)
 				return
 			}
 
@@ -295,7 +271,6 @@ func (infos *Infos) startUserBot(phone string) (err error) {
 				}
 				if err := infos.checkStatus(); err != nil {
 					log.Printf("UserBot 登录失败: %+v", err)
-					infos.resetStatus()
 					return
 				}
 			}
@@ -341,7 +316,7 @@ func (infos *Infos) startUserBotQR() (err error) {
 		if infos.UserClient.Load() == nil {
 			if err := infos.userBotClient(); err != nil {
 				log.Printf("UserBot 登录失败: %+v", err)
-				infos.resetStatus()
+				infos.stopUserClient(false)
 				return err
 			}
 		}
@@ -351,7 +326,7 @@ func (infos *Infos) startUserBotQR() (err error) {
 		if infos.UserClient.Load() == nil {
 			if err := infos.userBotClient(); err != nil {
 				log.Printf("UserBot 登录失败: %+v", err)
-				infos.resetStatus()
+				infos.stopUserClient(false)
 				infos.LoMu.Unlock()
 				return err
 			}
@@ -373,14 +348,13 @@ func (infos *Infos) startUserBotQR() (err error) {
 				} else {
 					sendMS(nil, fmt.Sprintf("获取 QR 登录失败: %+v", err), nil, 60)
 				}
-				infos.resetStatus()
+				infos.stopUserClient(false)
 				return
 			}
 
 			if qr.Url() == "" {
 				if err := infos.checkStatus(); err != nil {
 					log.Printf("UserBot 登录失败: %+v", err)
-					infos.resetStatus()
 				}
 				return
 			}
@@ -411,7 +385,6 @@ func (infos *Infos) startUserBotQR() (err error) {
 
 			if err := infos.checkStatus(); err != nil {
 				log.Printf("UserBot 登录失败: %+v", err)
-				infos.resetStatus()
 				return
 			}
 		})
@@ -421,23 +394,26 @@ func (infos *Infos) startUserBotQR() (err error) {
 }
 
 // checkStatus 获取当前 UserBot 登录状态并校验 ID 是否合法
-func (infos *Infos) checkStatus() (err error) {
-	// 登录成功
-	me, getMeErr := infos.UserClient.Load().GetMe()
+func (infos *Infos) checkStatus() error {
+	me, err := infos.UserClient.Load().GetMe()
+	return infos.applyUserStatus(me, err)
+}
+
+func (infos *Infos) applyUserStatus(me *telegram.UserObj, getMeErr error) (err error) {
 	if err = checkUser(me, getMeErr, infos.Conf.Load().UserID); err != nil {
 		log.Printf("获取用户信息失败: %+v", err)
-		infos.Mutex.Lock()
-		infos.Status.Store(0)
-		infos.Mutex.Unlock()
 		if getMeErr != nil || me == nil {
+			for {
+				status := infos.Status.Load()
+				if status == 3 || status == 0 || infos.Status.CompareAndSwap(status, 0) {
+					break
+				}
+			}
 			return err
 		}
+		infos.Status.Store(0)
 		log.Printf("登录失败: 用户ID不匹配, 期望 %d, 实际 %d", infos.Conf.Load().UserID, me.ID)
-		if client := infos.UserClient.Load(); client != nil {
-			if disconnectErr := client.Disconnect(); disconnectErr != nil {
-				log.Printf("UserBot 退出失败: %+v", disconnectErr)
-			}
-		}
+
 		infos.resetStatus()
 		return combineErrors(err, infos.userBotClient())
 	}
@@ -479,7 +455,7 @@ func (infos *Infos) finishQR(err error) bool {
 	if err == nil {
 		return false
 	}
-	infos.resetStatus()
+	infos.stopUserClient(false)
 	return true
 }
 
@@ -493,35 +469,13 @@ func (infos *Infos) handleQRWaitResult(err error, report func(error)) bool {
 
 // resetStatus 断开 UserBot 连接并清理 session/cache, 将状态重置为未登录
 func (infos *Infos) resetStatus() {
-	// 排空可能残留的旧验证码/密码
-	select {
-	case <-infos.Code:
-	default:
-	}
-	select {
-	case <-infos.Pass:
-	default:
-	}
-
-	// 1. 断开连接并清理句柄
-	if client := infos.UserClient.Load(); client != nil {
-		if err := client.Disconnect(); err != nil {
-			log.Printf("UserBot 断开连接失败: %+v", err)
-		}
-	}
-	// 2. 清理磁盘上的 Session 和 Cache 文件（防止因文件损坏导致的下次循环失败）
-	cleanFiles(CleanRealm{Cate: "user", Realm: "session"})
-	cleanFiles(CleanRealm{Cate: "user", Realm: "cache", Filter: false})
-
-	// 3. 重置内存状态
-	infos.UserClient.Store(nil)
-	infos.Status.Store(0)
+	infos.stopUserClient(true)
 }
 
 // waitSrc 是登录流程的通用等待器: CAS 原子转移状态成功后, 通过 Bot 提示用户输入,
 // 再在通道与超时之间二选一等待结果, 超时自动重置为未登录状态并返回错误
 func (infos *Infos) waitSrc(from, to int32, input chan string, stateName, waitMsg, timeoutMsg string) (string, error) {
-	if !infos.Status.CompareAndSwap(from, to) {
+	if !infos.Status.CompareAndSwap(from, to) && infos.Status.Load() != to {
 		err := fmt.Errorf("当前状态不是等待%s", stateName)
 		sendMS(nil, err.Error(), nil, 60)
 		return "", err
@@ -566,6 +520,9 @@ func (infos *Infos) submitCode(str string) (err error) {
 
 	code := sb.String()
 	infos.Mutex.Unlock() // 发送前解锁，允许阻塞但不会死锁全局
+	if code == "" {
+		return errors.New("验证码必须包含数字")
+	}
 
 	// 非阻塞写入：缓冲容量为 1 且读取方 code() 是唯一消费者,
 	// 缓冲满即代表已有未消费的验证码（重复提交/读取方已超时）, 直接拒绝,
@@ -627,70 +584,18 @@ func (infos *Infos) wakeTCP(client *telegram.Client, cate string) error {
 
 type connectClient interface {
 	PingContext(context.Context) (time.Duration, error)
-	Disconnect() error
-	Connect() error
+	Reconnect(context.Context, bool) error
 }
 
 func (infos *Infos) wakeTCPClient(client connectClient, cate string) error {
-	mu := infos.connectMu(cate)
-	mu.Lock()
-	defer mu.Unlock()
+	return infos.wakeTCPClientContext(context.Background(), client, cate)
+}
 
-	debug := infos.Conf.Load().DeBUG
-	stat := infos.connectStat(cate)
-
-	// 设置较短超时
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	// 最轻量探活 RPC
-	latenc, err := client.PingContext(ctx)
-	if err != nil {
-		if debug {
-			log.Printf("TCP 链路异常, 正在重连: %+v", err)
-		}
-		// 重连带退避重试, 避免一次瞬时故障就把链路误判为永久死亡
-		const maxReconnect = 3
-		var lastErr error
-		for count := 1; count <= maxReconnect; count++ {
-			// 强制断开
-			if err := client.Disconnect(); err != nil {
-				log.Printf("强制断开 TCP 连接失败: %+v", err)
-			}
-			// 重连
-			if err := client.Connect(); err != nil {
-				lastErr = err
-				log.Printf("重连 TCP 失败(第 %d/%d 次): %+v", count, maxReconnect, err)
-				time.Sleep(time.Duration(count) * 500 * time.Millisecond)
-				continue
-			}
-			// 重连后再次验证，必须使用全新的 context，防止使用已过期的旧 context
-			newCtx, newCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			value, verr := client.PingContext(newCtx)
-			newCancel()
-			if verr != nil {
-				lastErr = verr
-				log.Printf("重连 TCP 后验证失败(第 %d/%d 次): %+v", count, maxReconnect, verr)
-				time.Sleep(time.Duration(count) * 500 * time.Millisecond)
-				continue
-			}
-			if debug {
-				log.Printf("TCP 链路已恢复, 延迟: %dms", value.Milliseconds())
-			}
-			stat.wake(value.Milliseconds())
-			return nil
-		}
-		// 多次重试均失败, 最终标记链路死亡
-		log.Printf("重连 TCP 连续 %d 次失败, 标记链路死亡: %+v", maxReconnect, lastErr)
-		stat.markDead()
-		return lastErr
+func (infos *Infos) wakeTCPContext(ctx context.Context, client *telegram.Client, cate string) error {
+	if client == nil {
+		return errors.New("client 不能为 nil")
 	}
-
-	if debug {
-		log.Printf("TCP 链路正常, 延迟: %dms", latenc.Milliseconds())
-	}
-	stat.wake(latenc.Milliseconds())
-	return nil
+	return infos.wakeTCPClientContext(ctx, client, cate)
 }
 
 // botConf 构造 Telegram 客户端所需的通用配置
@@ -796,14 +701,15 @@ func (infos *Infos) advanceWaitUntilUnix(candidate int64) {
 
 // list
 func (infos *Infos) list(channel string, page, limit int, offset int32, filter int64, reverse bool, ctx context.Context) (items Items, err error) {
-	channelInfo, err := infos.handleChannel(channel)
+	channelInfo, err := infos.handleChannelContext(ctx, channel)
 	if err != nil {
 		return items, err
 	}
-	if page == 1 {
-		handleOffset("del", channel, 0)
-	} else {
-		offset = handleOffset("get", fmt.Sprintf("%s|%d", channel, page), 0)
+	if page <= 1 && offset == 0 {
+		handleOffset("clearPrefix", fmt.Sprintf("list|%s|%d|", channel, limit), 0)
+	}
+	if page > 1 && offset == 0 {
+		offset = handleOffset("get", fmt.Sprintf("list|%s|%d|%d", channel, limit, page), 0)
 		// 偏移量缓存过期（>1h）时 offset 回退为 0, 则从第 1 页重新开始, 不再报错
 	}
 
@@ -828,30 +734,20 @@ func (infos *Infos) list(channel string, page, limit int, offset int32, filter i
 	case 0:
 		return items, errors.New("未找到匹配消息")
 	case limit:
-		handleOffset("set", fmt.Sprintf("%s|%d", channel, page+1), ms[lenMs-1].ID)
+		handleOffset("set", fmt.Sprintf("list|%s|%d|%d", channel, limit, page+1), ms[lenMs-1].ID)
 		items.HasMore = true
 	}
 
-	// 按频道读取上一页遗留的相册边界去重信息, latestMIDs 精确匹配消息 ID,
-	// 不再用字符串子串匹配（会把 ID=12 误判为 ID=123 的子串导致误删), 且按频道隔离, 避免不同频道间 mid 相同时互相污染
-	infos.Mutex.RLock()
-	latestGroup := infos.LatestMIDss[channel]
-	infos.Mutex.RUnlock()
-	latestCount := 0
-	var latestMIDs map[int32]bool
-	if latestGroup != nil {
-		latestCount = latestGroup.Count
-		latestMIDs = latestGroup.MIDs
+	nextOffset := ms[lenMs-1].ID
+	tailGroup := int64(0)
+	if ms[lenMs-1].Message != nil {
+		tailGroup = ms[lenMs-1].Message.GroupedID
 	}
-
 	mids := make(map[int32]bool)
 	maxNum := len(ms) - 1
 	TCPDead := false
 	for num, m := range ms {
 		if m.File == nil {
-			continue
-		}
-		if num <= latestCount && latestMIDs[m.ID] {
 			continue
 		}
 
@@ -864,42 +760,39 @@ func (infos *Infos) list(channel string, page, limit int, offset int32, filter i
 		}
 
 		if items.Channel == "" {
-			items.Channel = strings.TrimSpace(m.Channel.Title)
+			if m.Channel != nil {
+				items.Channel = strings.TrimSpace(m.Channel.Title)
+			} else if m.Chat != nil {
+				items.Channel = strings.TrimSpace(m.Chat.Title)
+			}
 		}
 
-		if (num == 0 || num == maxNum) && m.Message.GroupedID != 0 {
-			medias, err := m.GetMediaGroup()
-			if err != nil {
-				log.Printf("提取媒体组错误: %+v", err)
-				TCPDead = true
+		if (num == 0 || num == maxNum) && m.Message != nil && m.Message.GroupedID != 0 {
+			medias := []telegram.NewMessage{m}
+			if m.Client != nil {
+				group, err := m.Client.GetMediaGroupContext(ctx, m.Peer, m.ID)
+				if err != nil {
+					if ctx != nil && ctx.Err() != nil {
+						return items, ctx.Err()
+					}
+					log.Printf("提取媒体组错误: %+v", err)
+					TCPDead = true
+				} else if len(group) > 0 {
+					medias = group
+				}
 			}
-
-			count := 0
-			newMIDs := make(map[int32]bool, len(medias))
 			for _, media := range medias {
+				if tailGroup != 0 && media.Message != nil && media.Message.GroupedID == tailGroup && media.ID > 0 && media.ID < nextOffset {
+					nextOffset = media.ID
+				}
+				if media.File == nil || (offset > 0 && media.ID >= offset) || mids[media.ID] {
+					continue
+				}
 				if isVideoFile(media.File.Ext) && media.File.Size < filter {
 					continue
 				}
-				if value, ok := mids[media.ID]; ok && value {
-					continue
-				}
-
-				if latestMIDs[media.ID] {
-					break
-				}
-
-				count++
-				newMIDs[media.ID] = true
 				mids[media.ID] = true
-				item := handleItem(media)
-				items.Item = append(items.Item, item)
-			}
-			if num == maxNum {
-				infos.Mutex.Lock()
-				if evictOldestLatestGID(infos.LatestMIDss, infos.MaxChannel) {
-					infos.LatestMIDss[channel] = &LatestMIDs{Count: count, MIDs: newMIDs, Time: time.Now()}
-				}
-				infos.Mutex.Unlock()
+				items.Item = append(items.Item, handleItem(media))
 			}
 		} else {
 			mids[m.ID] = true
@@ -908,6 +801,9 @@ func (infos *Infos) list(channel string, page, limit int, offset int32, filter i
 		}
 	}
 
+	if items.HasMore {
+		handleOffset("set", fmt.Sprintf("list|%s|%d|%d", channel, limit, page+1), nextOffset)
+	}
 	sortItems(items.Item, reverse)
 	items.ID = channel
 
@@ -929,13 +825,16 @@ func (infos *Infos) list(channel string, page, limit int, offset int32, filter i
 
 // search 在指定频道中搜索关键词并返回匹配的媒体文件列表
 func (infos *Infos) search(channel, keywords string, page, limit int, offset int32, filter int64, reverse bool, ctx context.Context) (items Items, err error) {
-	channelInfo, err := infos.handleChannel(channel)
+	channelInfo, err := infos.handleChannelContext(ctx, channel)
 	if err != nil {
 		return items, err
 	}
 
+	if page <= 1 && offset == 0 {
+		handleOffset("clearPrefix", fmt.Sprintf("search|%s|%s|%d|", channel, keywords, limit), 0)
+	}
 	if offset == 0 {
-		key := fmt.Sprintf("%s|%s|%d", channel, keywords, page)
+		key := fmt.Sprintf("search|%s|%s|%d|%d", channel, keywords, limit, page)
 		offset = handleOffset("get", key, offset)
 		// 偏移量缓存过期（>1h）时 offset 回退为 0, 则从第 1 页重新开始, 不再报错
 	}
@@ -961,7 +860,7 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 	case 0:
 		return items, errors.New("未找到匹配消息")
 	case limit:
-		key := fmt.Sprintf("%s|%s|%d", channel, keywords, page+1)
+		key := fmt.Sprintf("search|%s|%s|%d|%d", channel, keywords, limit, page+1)
 		handleOffset("set", key, ms[lenMs-1].ID)
 		items.HasMore = true
 	}
@@ -976,7 +875,11 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 		}
 
 		if items.Channel == "" {
-			items.Channel = strings.TrimSpace(m.Channel.Title)
+			if m.Channel != nil {
+				items.Channel = strings.TrimSpace(m.Channel.Title)
+			} else if m.Chat != nil {
+				items.Channel = strings.TrimSpace(m.Chat.Title)
+			}
 		}
 		items.Item = append(items.Item, handleItem(m))
 	}
@@ -995,6 +898,9 @@ const listFreshTTL = 30 * time.Second
 // 同时 result 仍是非 nil 的空 MsCache（load 得到空切片）。
 // 这样调用方即使漏检查 err, 也不会因 nil 指针 panic——见下预初始化。
 func (infos *Infos) handleMs(params HandleMs) (result *MsCache, err error) {
+	if params.Ctx != nil && params.Ctx.Err() != nil {
+		return &MsCache{Cate: params.Cate}, params.Ctx.Err()
+	}
 	debug := infos.Conf.Load().DeBUG
 
 	// 1. 选择下载客户端
@@ -1013,6 +919,9 @@ func (infos *Infos) handleMs(params HandleMs) (result *MsCache, err error) {
 	// 都返回合法的 *MsCache, 而非 nil 指针。MsCache 零值安全:
 	// load() 对空对象返回 nil 切片, 不会 panic。
 	result = &MsCache{Cate: params.Cate}
+	if client == nil {
+		return result, errors.New("对应客户端未就绪")
+	}
 
 	stat := infos.connectStat(params.Cate)
 	latenc := stat.Latenc.Load()
@@ -1022,7 +931,7 @@ func (infos *Infos) handleMs(params HandleMs) (result *MsCache, err error) {
 	// 当 TCPDead 为 true 或距离上次唤醒超过 30 分钟时强制触发探活重连
 	switch {
 	case duration.Minutes() > 30 || stat.TCPDead.Load():
-		if err = infos.wakeTCP(client, params.Cate); err != nil {
+		if err = infos.wakeTCPContext(params.Ctx, client, params.Cate); err != nil {
 			log.Printf("唤醒 TCP 连接失败: %+v", err)
 			return result, err
 		}
@@ -1044,14 +953,13 @@ func (infos *Infos) handleMs(params HandleMs) (result *MsCache, err error) {
 	}
 
 	src := ""
-	kname := params.Cate
 
 	var channelInfo struct {
 		value    any
 		Username string
 	}
 	if len(params.CNames) > 0 {
-		channel, err := infos.handleChannel(params.CNames[0])
+		channel, err := infos.handleChannelContext(params.Ctx, params.CNames[0])
 		if err != nil {
 			return result, err
 		}
@@ -1059,7 +967,6 @@ func (infos *Infos) handleMs(params HandleMs) (result *MsCache, err error) {
 		channelInfo.Username = channel.UserName
 		params.CID = channel.CID
 		src = "name=" + channel.UserName
-		kname += ":" + channel.UserName
 	} else {
 		channelInfo.value = params.CID
 	}
@@ -1070,14 +977,12 @@ func (infos *Infos) handleMs(params HandleMs) (result *MsCache, err error) {
 	} else {
 		src += ", cid=" + cidStr
 	}
-	kname += ":" + cidStr
 
 	if len(params.MIDs) > 0 {
 		src += ", mids=["
 		for _, mid := range params.MIDs {
 			midStr := strconv.FormatInt(int64(mid), 10)
 			src += midStr + ", "
-			kname += ":" + midStr
 		}
 		src = strings.TrimRight(src, ", ")
 		src += "]"
@@ -1086,12 +991,10 @@ func (infos *Infos) handleMs(params HandleMs) (result *MsCache, err error) {
 	if params.OffsetID > 0 {
 		offsetIDStr := strconv.FormatInt(int64(params.OffsetID-1), 10)
 		src += ", offset=" + offsetIDStr
-		kname += ":" + offsetIDStr
 	}
 
 	if params.Words != "" {
 		src += ", keywords=" + params.Words
-		kname += ":" + params.Words
 	}
 
 	lenMIDs := len(params.MIDs)
@@ -1105,34 +1008,34 @@ func (infos *Infos) handleMs(params HandleMs) (result *MsCache, err error) {
 	freshDo := lenMIDs == 0 && params.OffsetID == 0
 
 	// 不同 Limit 的请求不能共用同一份缓存, 否则会返回条数与请求不符的结果（见 kname 说明）
-	kname += ":limit=" + strconv.Itoa(params.Limit)
+	kname := messageCacheKey(params, channelInfo.Username)
 
 	hit := false
 	infos.Mutex.RLock()
-	result, ok := infos.MsCache[kname]
+	cached, ok := infos.MsCache[kname]
 	infos.Mutex.RUnlock()
 
-	// hit 的判断与 result.Time 的更新必须在同一把锁内完成：Time 可能被
+	// hit 的判断与 cached.Time 的更新必须在同一把锁内完成：Time 可能被
 	// refreshMs 或流式下载完成后的缓存回写并发更新（Mes 本身是原子快照, 无需锁保护读取）
 	if ok {
 		infos.Mutex.Lock()
-		mes := result.load()
+		mes := cached.load()
 		if len(mes) > 0 {
 			if freshDo {
 				// 首页请求只接受短 TTL 内的结果, 过期即重新拉取, 保证新内容及时可见
-				if time.Since(result.Time) < listFreshTTL {
+				if time.Since(cached.Time) < listFreshTTL {
 					hit = true
-					result.Time = time.Now()
 				}
 			} else if len(mes) >= params.Limit {
 				hit = true
-				result.Time = time.Now()
+				cached.Time = time.Now()
 			}
 		}
 		infos.Mutex.Unlock()
 	}
 
 	if hit {
+		result = cached
 		if debug {
 			log.Printf("命中消息缓存: %s", kname)
 		}
@@ -1147,6 +1050,9 @@ func (infos *Infos) handleMs(params HandleMs) (result *MsCache, err error) {
 		}
 		ms, err := client.GetMessages(channelInfo.value, param)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return result, err
+			}
 			// 异步尝试重连, 使后续请求到达时连接可能已恢复
 			safeGo(func() {
 				stat.fail(client)
@@ -1193,6 +1099,9 @@ func (infos *Infos) handleMs(params HandleMs) (result *MsCache, err error) {
 // 刷新消息, 用于异步下载完成后的缓存更新
 // client 由调用方显式传入（而非读取共享的 infos.Client），避免并发请求下客户端选择互相覆盖
 func (infos *Infos) refreshMs(client *telegram.Client, version int64, params HandleMs, msCache *MsCache) (src telegram.NewMessage, err error) {
+	if params.Ctx != nil && params.Ctx.Err() != nil {
+		return src, params.Ctx.Err()
+	}
 	debug := infos.Conf.Load().DeBUG
 
 	// 快速路径：版本已变化, 说明其它协程已完成刷新, 直接复用其结果。
@@ -1216,6 +1125,9 @@ func (infos *Infos) refreshMs(client *telegram.Client, version int64, params Han
 		Context: params.Ctx,
 	})
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return src, err
+		}
 		safeGo(func() {
 			status := infos.connectStat(params.Cate)
 			status.fail(client)
@@ -1265,15 +1177,23 @@ func (infos *Infos) refreshMs(client *telegram.Client, version int64, params Han
 
 // handleChannel 处理频道ID, 返回 InputPeer
 func (infos *Infos) handleChannel(channel string, hash ...int64) (result ChannelInfo, err error) {
+	return infos.handleChannelContext(context.Background(), channel, hash...)
+}
+
+func (infos *Infos) handleChannelContext(ctx context.Context, channel string, hash ...int64) (result ChannelInfo, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	infos.Mutex.RLock()
 	cache, ok := infos.ChannelID[channel]
 	infos.Mutex.RUnlock()
 	if !ok {
 		src := strings.TrimPrefix(channel, "@")
 		if isAllNumber(src) {
-			if !strings.HasPrefix(src, "-100") {
-				src = "-100" + src
-			}
+			src = strings.TrimPrefix(src, "-100")
 			cid, err := strconv.ParseInt(src, 10, 64)
 			if err != nil {
 				log.Printf("频道 %s 解析失败: %+v", channel, err)
@@ -1285,8 +1205,8 @@ func (infos *Infos) handleChannel(channel string, hash ...int64) (result Channel
 			} else {
 				result.Hash = 0
 			}
-			result.Peer = &telegram.InputPeerUser{
-				UserID:     cid,
+			result.Peer = &telegram.InputPeerChannel{
+				ChannelID:  cid,
 				AccessHash: result.Hash,
 			}
 		} else {
@@ -1294,8 +1214,11 @@ func (infos *Infos) handleChannel(channel string, hash ...int64) (result Channel
 			if client == nil {
 				return result, errors.New("UserBot 客户端未就绪")
 			}
-			values, err := client.ResolvePeer(channel)
+			values, err := client.ResolvePeerContext(ctx, channel)
 			if err != nil {
+				if ctx.Err() != nil {
+					return result, ctx.Err()
+				}
 				safeGo(func() {
 					status := infos.connectStat("user")
 					status.fail(client)
@@ -1345,8 +1268,8 @@ func (infos *Infos) handleChannel(channel string, hash ...int64) (result Channel
 	} else {
 		infos.Mutex.Lock()
 		cache.Time = time.Now()
-		infos.Mutex.Unlock()
 		result = *cache
+		infos.Mutex.Unlock()
 		if infos.Conf.Load().DeBUG {
 			log.Printf("命中频道缓存: %s", channel)
 		}
@@ -1360,9 +1283,16 @@ func (infos *Infos) handleChannel(channel string, hash ...int64) (result Channel
 // 也可能是追加了评论的新切片。
 // limit 为本次希望拉取的评论条数（对应 HTTP 请求的分页大小), hasMore 表示 Telegram 一侧是否还有更多评论未拉取,
 // 由"实际拉取到的原始评论条数是否达到 limit"判断——不能用追加到 ms 后的条数判断, 因为其中非媒体消息会被过滤掉。
-// page 的续传方式对齐 search()：offset==0 时按 "comments|mid|page" 查缓存拿到真实游标，
+// page 的续传方式对齐 search()：offset==0 时按频道、帖子、页号和页大小查缓存拿到真实游标，
 // 不在缓存里且 page>1 说明跳页请求，直接报错（不能像 page=1 那样从头拉取）
-func (infos *Infos) handleComments(mid, offset int32, page, limit int, base []telegram.NewMessage) (ms []telegram.NewMessage, hasMore bool, err error) {
+func (infos *Infos) handleComments(mid, offset int32, page, limit int, base []telegram.NewMessage, contexts ...context.Context) (ms []telegram.NewMessage, hasMore bool, err error) {
+	ctx := context.Background()
+	if len(contexts) > 0 && contexts[0] != nil {
+		ctx = contexts[0]
+	}
+	if err := ctx.Err(); err != nil {
+		return base, false, err
+	}
 	ms = base
 	if len(ms) == 0 {
 		return ms, false, errors.New("未找到消息")
@@ -1371,22 +1301,31 @@ func (infos *Infos) handleComments(mid, offset int32, page, limit int, base []te
 		limit = 100
 	}
 
+	src := ms[0]
+	cid := src.ChatID()
+	if src.Channel != nil {
+		cid = src.Channel.ID
+	}
 	if offset == 0 {
-		key := fmt.Sprintf("comments|%d|%d", mid, page)
+		key := fmt.Sprintf("comments|%d|%d|%d|%d", cid, mid, page, limit)
 		offset = handleOffset("get", key, offset)
 		if page > 1 && offset == 0 {
 			return ms, false, errors.New("未找到匹配消息")
 		}
 	}
 
-	src := ms[0]
+	if src.Message == nil {
+		return ms, false, errors.New("消息内容无效")
+	}
 	if src.Message.Replies != nil && src.Message.Replies.ChannelID != 0 {
-		discussionID := src.Message.Replies.ChannelID
+		if src.Channel == nil {
+			return ms, false, errors.New("评论锚点缺少频道信息")
+		}
 		username := src.Channel.Username
 		if username == "" {
-			username = strconv.FormatInt(src.Chat.ID, 10)
+			username = strconv.FormatInt(src.Channel.ID, 10)
 		}
-		channelInfo, err := infos.handleChannel(username)
+		channelInfo, err := infos.handleChannelContext(ctx, username)
 		if err != nil {
 			log.Printf("获取频道失败: %+v", err)
 			return ms, false, err
@@ -1399,7 +1338,10 @@ func (infos *Infos) handleComments(mid, offset int32, page, limit int, base []te
 			}
 		}
 		client := infos.UserClient.Load()
-		results, err := client.MessagesGetReplies(&telegram.MessagesGetRepliesParams{
+		if client == nil {
+			return ms, false, errors.New("UserBot 客户端未就绪")
+		}
+		raw, err := client.MakeRequest(ctx, &telegram.MessagesGetRepliesParams{
 			Peer:     channelInfo.Peer,
 			Limit:    int32(limit),
 			OffsetID: offset,
@@ -1407,6 +1349,9 @@ func (infos *Infos) handleComments(mid, offset int32, page, limit int, base []te
 		})
 
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return ms, false, err
+			}
 			safeGo(func() {
 				status := infos.connectStat("user")
 				status.fail(client)
@@ -1420,6 +1365,11 @@ func (infos *Infos) handleComments(mid, offset int32, page, limit int, base []te
 			})
 			log.Printf("获取评论消息失败: cid=%d, mid=%d, err=%v", src.Channel.ID, mid, err)
 			return ms, false, err
+		}
+
+		results, ok := raw.(telegram.MessagesMessages)
+		if !ok {
+			return ms, false, fmt.Errorf("无效的评论响应类型: %T", raw)
 		}
 
 		// 从 MessagesGetReplies 的结果中提取原始消息列表和随附的 Chats。
@@ -1440,48 +1390,69 @@ func (infos *Infos) handleComments(mid, offset int32, page, limit int, base []te
 			log.Printf("收到未知的底层具体类型: %T, %v", v, v)
 		}
 
-		var discussionChannel *telegram.Channel
-		for _, ch := range chats {
-			if channel, ok := ch.(*telegram.Channel); ok {
-				client.Cache.UpdateChannel(channel)
-				if channel.ID == discussionID {
-					discussionChannel = channel
-				}
+		ms, hasMore, err = appendCommentsPageContext(ctx, client, ms, newMs, chats, mid, page, limit)
+		if err != nil {
+			return ms, false, err
+		}
+	}
+	return ms, hasMore, nil
+}
+
+// appendCommentsPage 合并已获取的评论页，缓存续传游标，并保持 base 快照只读。
+func appendCommentsPage(client *telegram.Client, base []telegram.NewMessage, newMs []telegram.Message, chats []telegram.Chat, mid int32, page, limit int) (ms []telegram.NewMessage, hasMore bool) {
+	ms, hasMore, _ = appendCommentsPageContext(context.Background(), client, base, newMs, chats, mid, page, limit)
+	return ms, hasMore
+}
+
+func appendCommentsPageContext(ctx context.Context, client *telegram.Client, base []telegram.NewMessage, newMs []telegram.Message, chats []telegram.Chat, mid int32, page, limit int) (ms []telegram.NewMessage, hasMore bool, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return base, false, err
+	}
+	src := base[0]
+	cid := src.Channel.ID
+	discussionID := src.Message.Replies.ChannelID
+	var discussionChannel *telegram.Channel
+	for _, ch := range chats {
+		if channel, ok := ch.(*telegram.Channel); ok {
+			client.Cache.UpdateChannel(channel)
+			if channel.ID == discussionID {
+				discussionChannel = channel
 			}
 		}
+	}
 
-		// 拉到的原始评论数达到 limit, 说明 Telegram 一侧大概率还有更多未拉取的评论
-		hasMore = len(newMs) >= limit
-
-		// PackMessages 将 []telegram.Message 转为 []*telegram.NewMessage；
-		// 上面已注册频道缓存，这里再兜底纠正一次 Channel(此前误写为 Chat.ID，对 item.CID 无效果)
-		// base 快照是共享只读的, 追加前必须拷贝出私有副本, 避免并发写者落在同槽位上竞争
-		startLen := len(ms)
-		ms = append([]telegram.NewMessage(nil), ms...)
-		for _, nm := range telegram.PackMessages(client, newMs) {
-			if !nm.IsMedia() {
-				continue
-			}
-			if nm.Channel == nil || nm.Channel.ID != discussionID {
-				switch {
-				case discussionChannel != nil:
-					nm.Channel = discussionChannel
-				case nm.Channel != nil:
-					nm.Channel.ID = discussionID
-					nm.Channel.Title = src.Channel.Title
-					nm.Channel.Username = src.Channel.Username
-					nm.Channel.AccessHash = src.Channel.AccessHash
-				}
-			}
-			ms = append(ms, *nm)
+	hasMore = len(newMs) >= limit
+	ms = append([]telegram.NewMessage(nil), base...)
+	packed, err := telegram.PackMessagesContext(ctx, client, newMs)
+	if err != nil {
+		return base, false, err
+	}
+	for _, nm := range packed {
+		if !nm.IsMedia() {
+			continue
 		}
-
-		// 记录下一页的续传游标, 供下次 page+1 请求时通过 handleOffset("get", ...) 取回，
-		// 跟 search() 里 "page -> offset" 的续传方式保持一致
-		if hasMore && len(ms) > startLen {
-			key := fmt.Sprintf("comments|%d|%d", mid, page+1)
-			handleOffset("set", key, ms[len(ms)-1].ID)
+		if nm.Channel == nil || nm.Channel.ID != discussionID {
+			switch {
+			case discussionChannel != nil:
+				nm.Channel = discussionChannel
+			case nm.Channel != nil:
+				channel := *nm.Channel
+				nm.Channel = &channel
+				nm.Channel.ID = discussionID
+				nm.Channel.Title = src.Channel.Title
+				nm.Channel.Username = src.Channel.Username
+				nm.Channel.AccessHash = src.Channel.AccessHash
+			}
 		}
+		ms = append(ms, *nm)
+	}
+
+	if hasMore && len(packed) > 0 {
+		key := fmt.Sprintf("comments|%d|%d|%d|%d", cid, mid, page+1, limit)
+		handleOffset("set", key, packed[len(packed)-1].ID)
 	}
 	return ms, hasMore, nil
 }
@@ -1525,6 +1496,9 @@ func handleLinks(res HackLink, item Item) (link string, err error) {
 
 // handleItem 处理消息媒体, 返回 Item
 func handleItem(m telegram.NewMessage) (item Item) {
+	if m.File == nil {
+		return item
+	}
 	src := strings.TrimSpace(m.Text())
 	src = strings.ReplaceAll(src, "_", "-")
 	src = strings.TrimSpace(src)
@@ -1549,8 +1523,12 @@ func handleItem(m telegram.NewMessage) (item Item) {
 	item.Src = src
 	item.Name = name
 	item.Size = m.File.Size
-	item.CID = m.Channel.ID
-	item.Username = m.Channel.Username
+	if m.Channel != nil {
+		item.CID = m.Channel.ID
+		item.Username = m.Channel.Username
+	} else {
+		item.CID = m.ChannelID()
+	}
 	item.MID = m.ID
 	if m.Message != nil {
 		item.Date = m.Message.Date

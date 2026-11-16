@@ -46,5 +46,8 @@ IDEA.md
 *test.go
 .idea
 
-# Keep migration contract regressions in the repository.
-!migration_test.go
+# Keep tests and generated review documents local.
+*_test.go
+test/
+tests/
+docs/

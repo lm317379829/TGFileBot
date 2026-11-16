@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -25,8 +26,6 @@ var (
 
 	// teleLinkRe 匹配 t.me 消息链接, 供 handleLink 与 handleMess 复用, 避免每次请求重复编译
 	teleLinkRe = regexp.MustCompile(`t\.me\/(c\/(\d+)|([a-zA-Z0-9_]+))\/(\d+)(?:.*(?:comment|thread)=(\d+))?`)
-	// sizeDitSuffixRe 判断缓存大小字符串末尾是否为纯数字（即无单位后缀）
-	sizeDitSuffixRe = regexp.MustCompile(`\d$`)
 )
 
 // isVideoFile 判断文件后缀是否为视频文件
@@ -87,30 +86,31 @@ func formatFileSize(size int64) string {
 // convertMaxSize 将用户输入的缓存大小字符串（如 "32M"）转换为字节数
 // 无法识别单位或数值部分时返回 error, 调用方应将其视为格式错误而非静默使用默认值
 func convertSize(str string) (int64, error) {
+	src := strings.TrimSpace(strings.ToUpper(str))
+	src = strings.TrimSpace(strings.TrimSuffix(src, "B"))
 	var unit int64 = 1
-	src := strings.ToUpper(str)
-	switch {
-	case strings.HasSuffix(src, "B"), sizeDitSuffixRe.MatchString(src):
-		src = strings.TrimSuffix(src, "B")
-		unit = 1
-	case strings.HasSuffix(src, "K"):
-		src = strings.TrimSuffix(src, "K")
-		unit = 1024
-	case strings.HasSuffix(src, "M"):
-		src = strings.TrimSuffix(src, "M")
-		unit = 1024 * 1024
-	case strings.HasSuffix(src, "G"):
-		src = strings.TrimSuffix(src, "G")
-		unit = 1024 * 1024 * 1024
-	default:
-		return 0, fmt.Errorf("无法识别的大小单位: %s", str)
+	if len(src) > 0 {
+		switch src[len(src)-1] {
+		case 'K':
+			unit = 1024
+		case 'M':
+			unit = 1024 * 1024
+		case 'G':
+			unit = 1024 * 1024 * 1024
+		}
+		if unit != 1 {
+			src = strings.TrimSpace(src[:len(src)-1])
+		}
 	}
-
 	value, err := strconv.ParseFloat(src, 64)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("无效的大小 %q: %w", str, err)
 	}
-	return int64(value * float64(unit)), nil
+	bytes := value * float64(unit)
+	if math.IsNaN(bytes) || math.IsInf(bytes, 0) || bytes < 0 || bytes >= math.Exp2(63) {
+		return 0, fmt.Errorf("大小超出合法范围: %q", str)
+	}
+	return int64(bytes), nil
 }
 
 // extractContent 从字符串中提取正文与可选的行数参数
@@ -370,6 +370,12 @@ func handleOffset(act, kname string, value int32) (offset int32) {
 	offSets.Mutex.Lock()
 	defer offSets.Mutex.Unlock()
 	switch strings.ToLower(act) {
+	case "clearprefix":
+		for key := range offSets.OffSets {
+			if strings.HasPrefix(key, kname) {
+				delete(offSets.OffSets, key)
+			}
+		}
 	case "get":
 		if values, ok := offSets.OffSets[kname]; ok {
 			if time.Since(values.Time) < time.Hour {

@@ -12,23 +12,32 @@ import (
 // Conf 结构体定义了程序运行所需的各项配置参数
 // 通过 json 标签与 config.json 文件进行映射
 type Conf struct {
-	DeBUG     bool     `json:"debug"`               // 开启DeBUG日志
-	Site      string   `json:"site"`                // 反代域名, 用于生成公开访问链接
-	AppHash   string   `json:"hash"`                // Telegram API Hash, 从 my.telegram.org 获取
-	BotToken  string   `json:"botToken"`            // Telegram Bot Token, 用于交互和管理
-	Proxy     string   `json:"proxy,omitempty"`     // 代理服务器地址, 用于连接 Telegram
-	Password  string   `json:"password,omitempty"`  // 访问 /link 接口时可选的身份验证密码
-	Channels  []string `json:"channels,omitempty"`  // 频道列表, 用于搜索
-	DC        int      `json:"dc,omitempty"`        // 指定连接的 Telegram 数据中心 (Data Center) ID
-	Port      int      `json:"port"`                // 本地 HTTP 服务监听的端口
-	Workers   int      `json:"workers,omitempty"`   // 文件下载/串流时的并发协程数
-	AppID     int32    `json:"id"`                  // Telegram API ID, 从 my.telegram.org 获取
-	MaxSize   int64    `json:"maxSize,omitempty"`   // 最大缓存大小
-	UserID    int64    `json:"userID"`              // 管理员的 Telegram 用户 ID
-	ChannelID int64    `json:"channelID,omitempty"` // 默认关联的频道 ID
-	AdminIDs  []int64  `json:"adminIDs,omitempty"`  // 管理员 ID 列表, 拥有管理权限
-	WhiteIDs  []int64  `json:"whiteIDs,omitempty"`  // 白名单 ID 列表, 允许使用部分功能
-	Rules     []string `json:"rules,omitempty"`     // 群管正则规则列表
+	DisableLegacyHash bool     `json:"disableLegacyHash,omitempty"` // 拒绝旧六位 hash；默认兼容已有链接
+	DeBUG             bool     `json:"debug"`                       // 开启DeBUG日志
+	Site              string   `json:"site"`                        // 反代域名, 用于生成公开访问链接
+	AppHash           string   `json:"hash"`                        // Telegram API Hash, 从 my.telegram.org 获取
+	BotToken          string   `json:"botToken"`                    // Telegram Bot Token, 用于交互和管理
+	Proxy             string   `json:"proxy,omitempty"`             // 代理服务器地址, 用于连接 Telegram
+	Password          string   `json:"password,omitempty"`          // 访问 /link 接口时可选的身份验证密码
+	Channels          []string `json:"channels,omitempty"`          // 频道列表, 用于搜索
+	DC                int      `json:"dc,omitempty"`                // 指定连接的 Telegram 数据中心 (Data Center) ID
+	Port              int      `json:"port"`                        // 本地 HTTP 服务监听的端口
+	Workers           int      `json:"workers,omitempty"`           // 文件下载/串流时的并发协程数
+	AppID             int32    `json:"id"`                          // Telegram API ID, 从 my.telegram.org 获取
+	MaxSize           int64    `json:"maxSize,omitempty"`           // 最大缓存大小
+	UserID            int64    `json:"userID"`                      // 管理员的 Telegram 用户 ID
+	ChannelID         int64    `json:"channelID,omitempty"`         // 默认关联的频道 ID
+	AdminIDs          []int64  `json:"adminIDs,omitempty"`          // 管理员 ID 列表, 拥有管理权限
+	WhiteIDs          []int64  `json:"whiteIDs,omitempty"`          // 白名单 ID 列表, 允许使用部分功能
+	Rules             []string `json:"rules,omitempty"`             // 群管正则规则列表
+}
+
+// boundedWorkers keeps connection and queue allocation within the supported range.
+func boundedWorkers(workers int) int {
+	if workers <= 0 {
+		return 1
+	}
+	return min(workers, 4)
 }
 
 // loadConf 从指定路径加载 config.json 配置文件
@@ -76,6 +85,7 @@ func loadConf(filesPath string) (*Conf, error) {
 		log.Printf("config.json 中 workers 无效: %d, 回退至默认值 2", conf.Workers)
 		conf.Workers = 2
 	}
+	conf.Workers = boundedWorkers(conf.Workers)
 	if conf.MaxSize <= 0 {
 		log.Printf("config.json 中 maxSize 无效: %d, 回退至默认值 32MB", conf.MaxSize)
 		conf.MaxSize = 32 * 1024 * 1024
@@ -112,7 +122,10 @@ func (infos *Infos) refreshConf(mutate func(c *Conf)) error {
 	if err := saveConf(newConf, infos.FilesPath); err != nil {
 		return err
 	}
+	infos.Mutex.Lock()
 	infos.Conf.Store(newConf)
+	infos.buildIDsLocked(newConf)
+	infos.Mutex.Unlock()
 	return nil
 }
 
@@ -128,10 +141,33 @@ func saveConf(conf *Conf, filesPath string) error {
 		return err
 	}
 
-	// 将字节数组写入到配置文件并返回结果
-	if err := os.WriteFile(configPath, bytes, 0644); err != nil {
-		log.Printf("写入 config.json 文件错误: %+v", err)
+	mode := os.FileMode(0600)
+	if info, err := os.Stat(configPath); err == nil {
+		mode = info.Mode().Perm()
+	} else if !os.IsNotExist(err) {
 		return err
+	}
+	file, err := os.CreateTemp(filesPath, ".config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := file.Name()
+	defer os.Remove(tempPath)
+	defer file.Close()
+	if err := file.Chmod(mode); err != nil {
+		return err
+	}
+	if _, err := file.Write(bytes); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, configPath); err != nil {
+		return fmt.Errorf("替换 config.json: %w", err)
 	}
 	return nil
 }

@@ -68,8 +68,9 @@ Create a `config.json` file in the program's running directory or the specified 
 | `proxy` | String | No | Empty | Proxy server address (supports SOCKS, HTTP, MTProxy, TG protocols) for connecting to Telegram |
 | `userID` | Integer | Yes | - | Main administrator's Telegram User ID (account corresponding to the UserBot) |
 | `password` | String | No | Empty | API access password (if set, all API calls require authentication) |
+| `disableLegacyHash` | Boolean | No | false | Accept only signed tokens or key passwords when true; enable after migration |
 | `dc` | Integer | No | 0 | Telegram Data Center ID (1-5, 0 means auto-select; can be specified if connection issues arise) |
-| `workers` | Integer | No | 1 | Number of concurrent download coroutines (1-4 recommended; too high may trigger rate limits) |
+| `workers` | Integer | No | 2 | Concurrent download workers, range 1-4; larger configured values are capped at 4 |
 | `maxSize` | Integer | No | 32MB | Maximum cache size (bytes); also constrains the upper limit for head/tail chunk cache allocation |
 | `channelID` | Integer | No | 0 | Bound default Channel ID (`cid` parameter can be omitted in API) |
 | `adminIDs` | Array | No | [] | List of secondary administrator IDs (has most permissions, excluding login permission) |
@@ -103,7 +104,7 @@ Go to the [Releases](https://github.com/lm317379829/TGFileBot/releases) page, do
 
 Source builds require the patched `gogramN` checkout next to this repository (`../gogramN`); its module remains `github.com/xAmarnath/gogram`. Do not use the old fork or unpatched upstream.
 
-CI: commit and push the migrated gogramN first, then set repository variable `GOGRAM_REF` to its full 40-character commit SHA. CI checks out this exact revision, not `@latest`. For a private library, provide read-only `GOGRAM_TOKEN`. This migration does not commit or push automatically.
+CI checks out the latest default branch of [lm317379829/gogramN](https://github.com/lm317379829/gogramN) into `_deps/gogramN` and uses it through a local module replacement. No extra library revision variable is required. Push dependency fixes to that repository before CI can use them.
 
 ```bash
 # Install dependencies
@@ -511,31 +512,25 @@ Extracts media files from a message's comment area.
 
 ### 💡 Authentication Explanation
 
-If `password` is configured, accessing all HTTP interfaces requires one of the following authentication methods in the URL:
+When `password` is configured, protected endpoints accept either a `key` password or a `hash` token. Status and health endpoints remain public.
 
-| Auth Method | URL Parameter | Description | Example |
-|:---|:---|:---|:---|
-| Plaintext password | `&key=yourpassword` | Pass the `password` value configured directly | `?key=mysecret123` |
-| Hash password | `&hash=xxxxxx` | More secure method, avoids exposing plaintext password | `?hash=a1b2c3` |
+| Method | URL parameter | Meaning |
+|:---|:---|:---|
+| Password | `key=yourpassword` | The configured access password |
+| Signed token | `hash=v2_...` | A 128-bit HMAC-SHA256 token used by newly generated links |
 
-**Hash calculation formula**: The first **6 characters** of the hexadecimal string of `md5(uid + password)`. The `uid` here is the user ID used when calculating the hash offline — it is NOT an HTTP request parameter.
+A new token is `v2_` followed by the hex encoding of the first 16 HMAC-SHA256 bytes. The message is `tgfilebot:hash:v2:{uid}`, and the key is `password`. The user ID must be authorized; it is not a required HTTP parameter. Changing the password revokes both token formats.
 
-**Calculation Example**:
-```
-uid = 8888
-password = mypass
-md5("8888mypass") = "7c......" → First 6 chars are "7c..."
-Final URL parameter: ?hash=7c....
-```
+Legacy six-character MD5 hashes remain accepted by default to preserve existing links. After migrating links, set `disableLegacyHash` to `true` and restart. Enable this option for new deployments; accepting legacy hashes retains the guessing risk of 24-bit tokens.
 
-Python Example Code:
 ```python
 import hashlib
+import hmac
 
 uid = 8888
 password = "mypass"
-hash_input = str(uid) + password
-hash_value = hashlib.md5(hash_input.encode()).hexdigest()[:6]
+message = f"tgfilebot:hash:v2:{uid}".encode()
+hash_value = "v2_" + hmac.new(password.encode(), message, hashlib.sha256).hexdigest()[:32]
 print(f"?hash={hash_value}")
 ```
 
@@ -673,7 +668,8 @@ docker restart tgfilebot
 import hashlib
 uid = 123456789
 password = "mypass"
-hash_val = hashlib.md5(f"{uid}{password}".encode()).hexdigest()[:6]
+import hmac
+hash_val = "v2_" + hmac.new(password.encode(), f"tgfilebot:hash:v2:{uid}".encode(), hashlib.sha256).hexdigest()[:32]
 # Use: ?hash={hash_val}
 ```
 
