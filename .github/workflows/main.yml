@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, new]
   pull_request:
-    branches: [main]
+    branches: [main, new]
   repository_dispatch:
   workflow_dispatch:
 
@@ -50,13 +50,9 @@ jobs:
       - name: 确定程序版本
         id: version
         env:
-          BUILD_REF: ${{ github.ref }}
           BUILD_SHA: ${{ github.sha }}
         run: |
-          build_version="$(go run . -version)"
-          if [[ "$BUILD_REF" == 'refs/heads/new' ]]; then
-            build_version="${build_version}-new.${BUILD_SHA:0:12}"
-          fi
+          build_version="$(go run . -version)+${BUILD_SHA:0:12}"
           printf 'version=%s\n' "$build_version" >> "$GITHUB_OUTPUT"
 
       - name: 编译
@@ -76,61 +72,23 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish-new:
-    name: Publish new build to latest
-    needs: build
-    if: github.ref == 'refs/heads/new' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
-    steps:
-      - name: 检出镜像构建文件
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: 取得已验证构建产物
-        uses: actions/download-artifact@v4
-        with:
-          name: tgfilebot-binaries
-          path: .
-
-      - name: 设置 QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: 设置 Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: 登录 Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
-
-      - name: 构建并推送 latest 镜像
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: lm317379829/tgfilebot:latest
-          labels: |
-            org.opencontainers.image.version=${{ needs.build.outputs.version }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.source=https://github.com/lm317379829/TGFileBot
-          cache-from: type=gha,scope=tgfilebot-new
-          cache-to: type=gha,scope=tgfilebot-new,mode=max
-
   release:
-    name: Publish verified main build
+    name: Publish verified release
     needs: build
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/new')
     runs-on: ubuntu-latest
     permissions:
       contents: write
       actions: write
+    concurrency:
+      group: tgfilebot-release
+      cancel-in-progress: false
     steps:
       - name: 检出发布文件
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
 
       - name: 取得已验证构建产物
@@ -145,6 +103,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WITH_V: false
+          RELEASE_BRANCHES: main,new
+          DEFAULT_BRANCH: ${{ github.ref_name }}
 
       - name: 写入版本说明
         env:
