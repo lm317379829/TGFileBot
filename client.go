@@ -38,6 +38,11 @@ func (infos *Infos) startBot() (err error) {
 	published := false
 	defer releaseClient(func() error { return closeTelegramClient(client) }, &published)
 
+	// Cache the bot username before handlers run; addressed commands must not
+	// trigger a metadata RPC or react to commands meant for another bot.
+	if me := client.Me(); me != nil {
+		infos.BotUsername = me.Username
+	}
 	// 注册 Bot 命令处理函数
 	client.On(telegram.OnMessage, handleBotCommand)
 
@@ -183,30 +188,30 @@ func releaseClient(disconnect func() error, published *bool) {
 }
 
 // userBotClient 创建并连接 UserBot 客户端（不执行登录, 仅建立连接）
-func (infos *Infos) userBotClient() (err error) {
-	appConf := infos.Conf.Load()
-	// 清理缓存
-	userID := strconv.FormatInt(appConf.UserID, 10)
-	if userID != "" && userID != "0" {
-		cleanFiles(CleanRealm{ID: userID, Cate: "user", Realm: "cache", Filter: true})
-	}
+func (infos *Infos) userBotClient() error {
+	return infos.ensureUserClient(func() (*telegram.Client, error) {
+		appConf := infos.Conf.Load()
+		// 清理缓存
+		userID := strconv.FormatInt(appConf.UserID, 10)
+		if userID != "" && userID != "0" {
+			cleanFiles(CleanRealm{ID: userID, Cate: "user", Realm: "cache", Filter: true})
+		}
 
-	clientConf := botConf("user")
-	if appConf.DC != 0 {
-		clientConf.DataCenter = appConf.DC
-	}
+		clientConf := botConf("user")
+		if appConf.DC != 0 {
+			clientConf.DataCenter = appConf.DC
+		}
 
-	client, err := openTelegramClient(clientConf, telegram.NewClient, func(client *telegram.Client) error {
-		return client.Connect()
+		client, err := openTelegramClient(clientConf, telegram.NewClient, func(client *telegram.Client) error {
+			return client.Connect()
+		})
+		if err != nil {
+			log.Printf("创建或连接 UserBot 失败: %+v", err)
+			return nil, err
+		}
+
+		return client, nil
 	})
-	if err != nil {
-		log.Printf("创建或连接 UserBot 失败: %+v", err)
-		return err
-	}
-
-	infos.UserClient.Store(client)
-
-	return err
 }
 
 // startUserBot 发起手机号登录流程
@@ -232,7 +237,7 @@ func (infos *Infos) startUserBot(phone string) (err error) {
 		if infos.UserClient.Load() == nil {
 			if err := infos.userBotClient(); err != nil {
 				log.Printf("UserBot 登录失败: %+v", err)
-				infos.stopUserClient(false)
+				infos.failedUserClientCreation()
 				return err
 			}
 		}
@@ -242,7 +247,7 @@ func (infos *Infos) startUserBot(phone string) (err error) {
 		if infos.UserClient.Load() == nil {
 			if err := infos.userBotClient(); err != nil {
 				log.Printf("UserBot 登录失败: %+v", err)
-				infos.stopUserClient(false)
+				infos.failedUserClientCreation()
 				infos.LoMu.Unlock()
 				return err
 			}
@@ -316,7 +321,7 @@ func (infos *Infos) startUserBotQR() (err error) {
 		if infos.UserClient.Load() == nil {
 			if err := infos.userBotClient(); err != nil {
 				log.Printf("UserBot 登录失败: %+v", err)
-				infos.stopUserClient(false)
+				infos.failedUserClientCreation()
 				return err
 			}
 		}
@@ -326,7 +331,7 @@ func (infos *Infos) startUserBotQR() (err error) {
 		if infos.UserClient.Load() == nil {
 			if err := infos.userBotClient(); err != nil {
 				log.Printf("UserBot 登录失败: %+v", err)
-				infos.stopUserClient(false)
+				infos.failedUserClientCreation()
 				infos.LoMu.Unlock()
 				return err
 			}
@@ -701,6 +706,10 @@ func (infos *Infos) advanceWaitUntilUnix(candidate int64) {
 
 // list
 func (infos *Infos) list(channel string, page, limit int, offset int32, filter int64, reverse bool, ctx context.Context) (items Items, err error) {
+	return infos.listWithMessages(channel, page, limit, offset, filter, reverse, ctx, infos.handleMs)
+}
+
+func (infos *Infos) listWithMessages(channel string, page, limit int, offset int32, filter int64, reverse bool, ctx context.Context, fetch func(HandleMs) (*MsCache, error)) (items Items, err error) {
 	channelInfo, err := infos.handleChannelContext(ctx, channel)
 	if err != nil {
 		return items, err
@@ -722,17 +731,24 @@ func (infos *Infos) list(channel string, page, limit int, offset int32, filter i
 		Cate:     "user",
 	}
 
-	msCache, err := infos.handleMs(params)
+	msCache, err := fetch(params)
+	if errors.Is(err, errNoMessages) {
+		items.ID = channel
+		items.Item = []Item{}
+		return items, nil
+	}
 	if err != nil {
 		return items, err
 	}
 
 	ms := msCache.load()
 	lenMs := len(ms)
+	items.Item = make([]Item, 0, lenMs)
 
 	switch lenMs {
 	case 0:
-		return items, errors.New("未找到匹配消息")
+		items.ID = channel
+		return items, nil
 	case limit:
 		handleOffset("set", fmt.Sprintf("list|%s|%d|%d", channel, limit, page+1), ms[lenMs-1].ID)
 		items.HasMore = true
@@ -850,15 +866,24 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 	}
 
 	msCache, err := infos.handleMs(params)
+	if errors.Is(err, errNoMessages) {
+		items.ID = channel
+		items.Word = keywords
+		items.Item = []Item{}
+		return items, nil
+	}
 	if err != nil {
 		return items, err
 	}
 
 	ms := msCache.load()
 	lenMs := len(ms)
+	items.Item = make([]Item, 0, lenMs)
 	switch lenMs {
 	case 0:
-		return items, errors.New("未找到匹配消息")
+		items.ID = channel
+		items.Word = keywords
+		return items, nil
 	case limit:
 		key := fmt.Sprintf("search|%s|%s|%d|%d", channel, keywords, limit, page+1)
 		handleOffset("set", key, ms[lenMs-1].ID)
@@ -1066,7 +1091,7 @@ func (infos *Infos) handleMs(params HandleMs) (result *MsCache, err error) {
 		}
 
 		if len(ms) == 0 {
-			err = errors.New("未获取到消息")
+			err = errNoMessages
 			if debug {
 				log.Printf("获取消息失败: %s, count=%d, err=%+v", src, len(ms), err)
 			}

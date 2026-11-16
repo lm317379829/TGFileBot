@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"github.com/xAmarnath/gogram/telegram"
 	"strconv"
 	"strings"
 )
+
+var errNoMessages = errors.New("未获取到消息")
 
 // Separate IDs, pagination, query text, and filters so unrelated requests cannot
 // accidentally address the same immutable message snapshot.

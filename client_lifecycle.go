@@ -53,6 +53,8 @@ func closeTelegramClient(client *telegram.Client) error {
 }
 
 func (infos *Infos) stopUserClient(discardSession bool) {
+	infos.UserClientMu.Lock()
+	defer infos.UserClientMu.Unlock()
 	client := infos.UserClient.Swap(nil)
 	infos.Status.Store(0)
 	select {
@@ -69,5 +71,34 @@ func (infos *Infos) stopUserClient(discardSession bool) {
 	if discardSession {
 		cleanFiles(CleanRealm{Cate: "user", Realm: "session"})
 		cleanFiles(CleanRealm{Cate: "user", Realm: "cache", Filter: false})
+	}
+}
+
+// ensureUserClient publishes one fully initialized client, retaining any live
+// instance instead of replacing it when startup and login commands overlap.
+func (infos *Infos) ensureUserClient(create func() (*telegram.Client, error)) error {
+	infos.UserClientMu.Lock()
+	defer infos.UserClientMu.Unlock()
+	if infos.UserClient.Load() != nil {
+		return nil
+	}
+	client, err := create()
+	if err != nil {
+		return err
+	}
+	if client == nil {
+		return errors.New("客户端初始化返回空对象")
+	}
+	infos.UserClient.Store(client)
+	return nil
+}
+
+// A failed creator owns no published client. It must not close a client that a
+// different waiting startup/login request may have published in the meantime.
+func (infos *Infos) failedUserClientCreation() {
+	infos.UserClientMu.Lock()
+	defer infos.UserClientMu.Unlock()
+	if infos.UserClient.Load() == nil {
+		infos.Status.Store(0)
 	}
 }

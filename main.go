@@ -103,7 +103,7 @@ type HackLink struct {
 	UID    int64                // 发起请求的用户 ID
 	Pass   string               // 可选密码
 	Hash   string               // 验证哈希
-	Match  []string             // 单条 t.me 链接的正则匹配结果（teleLinkRe 的一个 submatch）
+	Match  []string             // 单条 t.me 链接的正则匹配结果（findTelegramLinks 的一个结果）
 }
 
 type HandleMs struct {
@@ -243,34 +243,36 @@ func (s *TCPStatu) since() time.Duration {
 
 // Infos 结构体保存了程序运行时的全局状态和资源句柄
 type Infos struct {
-	BotClient   atomic.Pointer[telegram.Client] // 独立的 Bot 客户端（用于与用户交互）, 原子指针支持无锁并发读写
-	UserClient  atomic.Pointer[telegram.Client] // 全局 UserBot 客户端实例（用于读取私有内容和流式传输）, 原子指针支持无锁并发读写
-	Mutex       *sync.RWMutex                   // 全局互斥锁, 保护并发安全
-	Cond        *sync.Cond                      // 条件变量, 用于搜索并发限流等待（独立锁, 不与 Mutex 共用）
-	Conf        atomic.Pointer[Conf]            // 全局配置快照, 原子指针支持无锁并发读；更新走 refreshConf（写时拷贝）
-	ConfMu      *sync.Mutex                     // 序列化配置更新, 避免并发管理员命令互相覆盖对方的修改
-	LoMu        *sync.Mutex                     // 序列化 UserBot 登录流程, 覆盖从发起登录到后台 Login 结束的完整窗口, 防止并发 /phone、/qr 同时发起多个 Login
-	File        *os.File                        // 日志文件句柄
-	Rex         *regexp.Regexp                  // 用于解析 Telegram FloodWait 错误的正则
-	RexRules    []*regexp.Regexp                // 预编译的群管正则规则缓存
-	FilesPath   string                          // 配置文件存放目录
-	FilePath    string                          // 日志文件路径
-	MaxMs       int                             // 最大消息数
-	MaxChannel  int                             // 最大频道数
-	MaxMedia    int                             // 最大媒体数
-	BotID       int64                           // Bot 自身的 ID
-	Status      atomic.Int32                    // UserBot 登录状态: 0 未登录, 1 等待验证码, 2 等待二步验证, 3 已登录
-	WaitUntil   atomic.Int64                    // 等待结束时间
-	Code        chan string                     // 用于接收异步提交的验证码
-	Pass        chan string                     // 用于接收异步提交的二步验证密码
-	IDs         map[int64]ID                    // 用户 ID -> 权限标记
-	HashIndex   map[string]int64                // hash -> uid 反查表, 由 rebuildHashIndexLocked 统一维护, 供 checkHash O(1) 查找
-	LatestMIDss map[string]*LatestMIDs          // 频道 -> 最近一次相册边界去重信息, 见 LatestMIDs 注释
-	ChannelID   map[string]*ChannelInfo         // 缓存频道名到频道 ID 的映射, 减少重复查询
-	HeadCache   map[string]*MediaCache          // 缓存文件头部数据
-	TailCache   map[string]*MediaCache          // 缓存文件尾部数据
-	MsCache     map[string]*MsCache             // 缓存消息，避免频繁调用 GetMessages
-	TCPStatus   struct {
+	UserClientMu sync.Mutex                      // serializes UserBot creation, publication and disposal
+	BotUsername  string                          // set before registering Bot message handlers
+	BotClient    atomic.Pointer[telegram.Client] // 独立的 Bot 客户端（用于与用户交互）, 原子指针支持无锁并发读写
+	UserClient   atomic.Pointer[telegram.Client] // 全局 UserBot 客户端实例（用于读取私有内容和流式传输）, 原子指针支持无锁并发读写
+	Mutex        *sync.RWMutex                   // 全局互斥锁, 保护并发安全
+	Cond         *sync.Cond                      // 条件变量, 用于搜索并发限流等待（独立锁, 不与 Mutex 共用）
+	Conf         atomic.Pointer[Conf]            // 全局配置快照, 原子指针支持无锁并发读；更新走 refreshConf（写时拷贝）
+	ConfMu       *sync.Mutex                     // 序列化配置更新, 避免并发管理员命令互相覆盖对方的修改
+	LoMu         *sync.Mutex                     // 序列化 UserBot 登录流程, 覆盖从发起登录到后台 Login 结束的完整窗口, 防止并发 /phone、/qr 同时发起多个 Login
+	File         *os.File                        // 日志文件句柄
+	Rex          *regexp.Regexp                  // 用于解析 Telegram FloodWait 错误的正则
+	RexRules     []*regexp.Regexp                // 预编译的群管正则规则缓存
+	FilesPath    string                          // 配置文件存放目录
+	FilePath     string                          // 日志文件路径
+	MaxMs        int                             // 最大消息数
+	MaxChannel   int                             // 最大频道数
+	MaxMedia     int                             // 最大媒体数
+	BotID        int64                           // Bot 自身的 ID
+	Status       atomic.Int32                    // UserBot 登录状态: 0 未登录, 1 等待验证码, 2 等待二步验证, 3 已登录
+	WaitUntil    atomic.Int64                    // 等待结束时间
+	Code         chan string                     // 用于接收异步提交的验证码
+	Pass         chan string                     // 用于接收异步提交的二步验证密码
+	IDs          map[int64]ID                    // 用户 ID -> 权限标记
+	HashIndex    map[string]int64                // hash -> uid 反查表, 由 rebuildHashIndexLocked 统一维护, 供 checkHash O(1) 查找
+	LatestMIDss  map[string]*LatestMIDs          // 频道 -> 最近一次相册边界去重信息, 见 LatestMIDs 注释
+	ChannelID    map[string]*ChannelInfo         // 缓存频道名到频道 ID 的映射, 减少重复查询
+	HeadCache    map[string]*MediaCache          // 缓存文件头部数据
+	TailCache    map[string]*MediaCache          // 缓存文件尾部数据
+	MsCache      map[string]*MsCache             // 缓存消息，避免频繁调用 GetMessages
+	TCPStatus    struct {
 		Bot  TCPStatu
 		User TCPStatu
 	} // 记录TCP连接状态

@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 var (
@@ -23,9 +24,6 @@ var (
 		".f4v": true, ".webm": true, ".m4v": true, ".mov": true, ".3gp": true,
 		".ts": true, ".m3u8": true, ".rm": true, ".rmvb": true, ".iso": true,
 	}
-
-	// teleLinkRe 匹配 t.me 消息链接, 供 handleLink 与 handleMess 复用, 避免每次请求重复编译
-	teleLinkRe = regexp.MustCompile(`t\.me\/(c\/(\d+)|([a-zA-Z0-9_]+))\/(\d+)(?:.*(?:comment|thread)=(\d+))?`)
 )
 
 // isVideoFile 判断文件后缀是否为视频文件
@@ -123,16 +121,16 @@ func extractContent(src string) (string, *int) {
 		return "", &num
 	}
 
-	// 2. 寻找主体部分最后一个空格
-	count := strings.LastIndexByte(src, ' ')
+	// 2. Whitespace separates the optional count, including tabs and full-width spaces.
+	count := strings.LastIndexFunc(src, unicode.IsSpace)
 	if count == -1 {
 		return src, nil
 	}
 
 	// 3. 判断最后一个空格后面那一截是不是数字
-	content := src[count+1:]
+	content := strings.TrimSpace(src[count:])
 	if num, err := strconv.Atoi(content); err == nil {
-		return src[:count], &num
+		return strings.TrimSpace(src[:count]), &num
 	}
 
 	return src, nil

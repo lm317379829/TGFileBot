@@ -2,7 +2,7 @@ name: build TGFileBot
 
 on:
   push:
-    branches: [main]
+    branches: [main, new]
   pull_request:
     branches: [main]
   repository_dispatch:
@@ -19,6 +19,8 @@ jobs:
   build:
     name: Build and verify
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -45,12 +47,26 @@ jobs:
           go vet ./...
           (cd _deps/gogramN && go test -race ./... && go vet ./...)
 
-      - name: 编译
+      - name: 确定程序版本
+        id: version
+        env:
+          BUILD_REF: ${{ github.ref }}
+          BUILD_SHA: ${{ github.sha }}
         run: |
-          GOOS=linux GOARCH=386 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -o TGFileBot-linux-386
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -o TGFileBot-linux-amd64
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -o TGFileBot-linux-arm64
-          GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -o TGFileBot-freebsd-amd64
+          build_version="$(go run . -version)"
+          if [[ "$BUILD_REF" == 'refs/heads/new' ]]; then
+            build_version="${build_version}-new.${BUILD_SHA:0:12}"
+          fi
+          printf 'version=%s\n' "$build_version" >> "$GITHUB_OUTPUT"
+
+      - name: 编译
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          GOOS=linux GOARCH=386 CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$BUILD_VERSION" -tags netgo -o TGFileBot-linux-386
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$BUILD_VERSION" -tags netgo -o TGFileBot-linux-amd64
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$BUILD_VERSION" -tags netgo -o TGFileBot-linux-arm64
+          GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$BUILD_VERSION" -tags netgo -o TGFileBot-freebsd-amd64
 
       - name: 保存已验证构建产物
         uses: actions/upload-artifact@v4
@@ -59,6 +75,49 @@ jobs:
           path: TGFileBot-*
           if-no-files-found: error
           retention-days: 7
+
+  publish-new:
+    name: Publish new build to latest
+    needs: build
+    if: github.ref == 'refs/heads/new' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出镜像构建文件
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 取得已验证构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: tgfilebot-binaries
+          path: .
+
+      - name: 设置 QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: 构建并推送 latest 镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: lm317379829/tgfilebot:latest
+          labels: |
+            org.opencontainers.image.version=${{ needs.build.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/lm317379829/TGFileBot
+          cache-from: type=gha,scope=tgfilebot-new
+          cache-to: type=gha,scope=tgfilebot-new,mode=max
 
   release:
     name: Publish verified main build
@@ -107,14 +166,14 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: 登录 Docker Hub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
       - name: 提取元数据
         id: meta
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v5
         with:
           images: lm317379829/tgfilebot
           tags: |

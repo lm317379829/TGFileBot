@@ -25,29 +25,32 @@ type Task struct {
 
 // Stream 结构体用于管理大文件的并发下载和流式传输
 type Stream struct {
-	Ctx          context.Context        // 请求派生上下文, 用于取消下载
-	Cancel       context.CancelFunc     // 当前流的取消函数，不取消父请求
-	Workers      int                    // 下载并发协程数
-	MID          int32                  // Telegram 消息 ID
-	CID          int64                  // Telegram 频道/会话 ID
-	ChunkSize    int64                  // 每个下载分片的大小（通常 512KB 或 1MB）
-	ContentSize  int64                  // 文件的总大小
-	MaxCacheSize int64                  // 最大缓存大小
-	HeadSize     int64                  // 头部缓存大小
-	TailSize     int64                  // 尾部缓存大小
-	TaskStart    *int64                 // 当前已分配任务的下载起点
-	TaskEnd      *int64                 // 当前已分配任务的下载终点
-	FileName     string                 // 文件名
-	Error        error                  // 整个流运行过程中的错误
-	Version      atomic.Int64           // 文件版本号, 因引用过期刷新后递增
-	Init         atomic.Bool            // 是否已经初始化
-	Cate         string                 // 客户端类别 ("user"/"bot"), 用于标记主客户端 TCP 状态
-	Mutex        *sync.Mutex            // 用于保护并发安全
-	Tasks        chan *Task             // 任务管道, 用于向工作协程分发下载任务
-	Client       *telegram.Client       // Gogram 客户端实例
-	Src          *telegram.MessageMedia // Telegram 消息媒体源
-	Ms           []telegram.NewMessage  // Telegram 消息
-	Pools        []*telegram.WorkerPool // 每个工作协程的独立连接池 (Pools[numTask-1])
+	ContentIdentity     string // stable identity of the bytes initially requested
+	MessageCache        *MsCache
+	MessageCacheVersion int64
+	Ctx                 context.Context        // 请求派生上下文, 用于取消下载
+	Cancel              context.CancelFunc     // 当前流的取消函数，不取消父请求
+	Workers             int                    // 下载并发协程数
+	MID                 int32                  // Telegram 消息 ID
+	CID                 int64                  // Telegram 频道/会话 ID
+	ChunkSize           int64                  // 每个下载分片的大小（通常 512KB 或 1MB）
+	ContentSize         int64                  // 文件的总大小
+	MaxCacheSize        int64                  // 最大缓存大小
+	HeadSize            int64                  // 头部缓存大小
+	TailSize            int64                  // 尾部缓存大小
+	TaskStart           *int64                 // 当前已分配任务的下载起点
+	TaskEnd             *int64                 // 当前已分配任务的下载终点
+	FileName            string                 // 文件名
+	Error               error                  // 整个流运行过程中的错误
+	Version             atomic.Int64           // 文件版本号, 因引用过期刷新后递增
+	Init                atomic.Bool            // 是否已经初始化
+	Cate                string                 // 客户端类别 ("user"/"bot"), 用于标记主客户端 TCP 状态
+	Mutex               *sync.Mutex            // 用于保护并发安全
+	Tasks               chan *Task             // 任务管道, 用于向工作协程分发下载任务
+	Client              *telegram.Client       // Gogram 客户端实例
+	Src                 *telegram.MessageMedia // Telegram 消息媒体源
+	Ms                  []telegram.NewMessage  // Telegram 消息
+	Pools               []*telegram.WorkerPool // 每个工作协程的独立连接池 (Pools[numTask-1])
 }
 
 // newTask 初始化并返回一个 Task 对象
@@ -81,25 +84,27 @@ func newStream(ctx context.Context, client *telegram.Client, media telegram.Mess
 	maxChans := int(queueChunks)
 	// 注意：HeadSize/TailSize 不在此处计算，而是由调用方在拿到文件大小后
 	// 调用 mediaCacheSizes(size, maxCacheSize) 统一算出并赋值，避免两处重复计算互相覆盖
+	identity, _ := contentIdentity(media)
 	ctx, cancel := context.WithCancel(ctx)
 	return &Stream{
-		Ctx:          ctx,
-		Cancel:       cancel,
-		Client:       client,
-		Src:          &media,
-		Workers:      workers,
-		FileName:     name,
-		MID:          mid,
-		CID:          cid,
-		Cate:         cate,
-		ContentSize:  contentSize,
-		ChunkSize:    chunkSize, // 这里设置了固定值, 可以根据需要调整
-		MaxCacheSize: maxCacheSize,
-		Tasks:        make(chan *Task, maxChans),
-		Mutex:        new(sync.Mutex),
-		TaskStart:    new(int64),
-		TaskEnd:      new(int64),
-		Pools:        make([]*telegram.WorkerPool, workers), // 每个工作协程一个独立 slot
+		ContentIdentity: identity,
+		Ctx:             ctx,
+		Cancel:          cancel,
+		Client:          client,
+		Src:             &media,
+		Workers:         workers,
+		FileName:        name,
+		MID:             mid,
+		CID:             cid,
+		Cate:            cate,
+		ContentSize:     contentSize,
+		ChunkSize:       chunkSize, // 这里设置了固定值, 可以根据需要调整
+		MaxCacheSize:    maxCacheSize,
+		Tasks:           make(chan *Task, maxChans),
+		Mutex:           new(sync.Mutex),
+		TaskStart:       new(int64),
+		TaskEnd:         new(int64),
+		Pools:           make([]*telegram.WorkerPool, workers), // 每个工作协程一个独立 slot
 	}
 }
 
@@ -193,7 +198,7 @@ func (stream *Stream) downloadTask(numTask int, task *Task, offset, contentEnd i
 	defer task.Budget.Close()
 	budgetCtx := task.Budget.Context()
 	chunkSize := stream.ChunkSize
-	cacheKey := mediaCacheName(stream.CID, stream.MID)
+	cacheKey := stream.mediaCacheKey()
 	// 尝试下载该分片
 	// 越靠近文件开头或结尾, 给予更多重试次数（先乘后除, 避免整数除法截断导致条件恒真）
 	maxCount := 3
@@ -366,7 +371,7 @@ func (stream *Stream) downloadTask(numTask int, task *Task, offset, contentEnd i
 		}
 
 		// 缓存
-		if stream.HeadSize > 0 && stream.TailSize > 0 {
+		if cacheKey != "" && stream.HeadSize > 0 && stream.TailSize > 0 {
 			infos.Mutex.Lock()
 			switch {
 			case task.ContentStart <= stream.HeadSize && task.ContentEnd <= stream.HeadSize:
@@ -470,6 +475,9 @@ func (stream *Stream) refresh(numTask int, version int64, contexts ...context.Co
 	}
 	stream.Mutex.Lock()
 	defer stream.Mutex.Unlock()
+	if stream.Error != nil {
+		return stream.Error
+	}
 
 	// 如果版本号已经变了, 说明其他协程已经完成了刷新
 	if version != stream.Version.Load() {
@@ -488,23 +496,10 @@ func (stream *Stream) refresh(numTask int, version int64, contexts ...context.Co
 		stream.Error = err
 		return err
 	}
-	if len(ms) == 0 {
-		err = fmt.Errorf("获取消息失败: cid=%d, mid=%d, err=未获取到消息", stream.CID, stream.MID)
+	if err := stream.setRefreshedMessages(ms); err != nil {
 		stream.Error = err
 		return err
 	}
-	src := ms[0]
-
-	// 确保消息依然包含媒体内容
-	if !src.IsMedia() {
-		err = fmt.Errorf("消息不包含媒体: cid=%d, mid=%d", stream.CID, stream.MID)
-		stream.Error = err
-		return err
-	}
-	// 更新流中的媒体引用
-	stream.Ms = ms
-	*stream.Src = src.Media()
-	stream.Version.Add(1)
 	if infos.Conf.Load().DeBUG {
 		log.Printf("文件引用已刷新: cid=%d, mid=%d, numTask=%d, version=%d, newVersion=%d", stream.CID, stream.MID, numTask, version, stream.Version.Load())
 	}
@@ -567,6 +562,9 @@ func (task *Task) handleContent(content []byte, offset, contentEnd int64) {
 }
 
 func (stream *Stream) handleCache(task *Task, cacheKey string, offset, contentEnd int64) (found bool) {
+	if cacheKey == "" {
+		return false
+	}
 	infos.Mutex.Lock()
 	defer infos.Mutex.Unlock()
 	// 从缓存读取
