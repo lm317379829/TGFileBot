@@ -4,7 +4,7 @@
 
 TGFileBot 是一个 TeleBot 和 UserBot 深度结合的开源项目，旨在提供高性能的文件直链提取、媒体分片流式传输以及完善的远程机器人管理功能。
 
-> ⚠️ **重要提示**: 本项目使用了修改版的 [gogram](https://github.com/lm317379829/gogram) 库。
+> ⚠️ **重要提示**: 本项目使用了修改版的 [gogramN](https://github.com/lm317379829/gogramN) 库。
 
 **⭐ 项目特色**：采用生产级并发架构，支持 HTTP Range 分片流式下载、自动引用刷新、多级缓存优化等高级特性。
 
@@ -68,8 +68,9 @@ TGFileBot 是一个 TeleBot 和 UserBot 深度结合的开源项目，旨在提�
 | `proxy` | 字符串 | 否 | 空 | 代理服务器地址（支持 SOCKS、HTTP、MTProxy、TG 协议），用于连接 Telegram |
 | `userID` | 整数 | 是 | - | 主管理员 Telegram 用户 ID（UserBot 对应的账号）|
 | `password` | 字符串 | 否 | 空 | 接口访问密码（若设置则所有 API 调用需鉴权）|
+| `disableLegacyHash` | 布尔 | 否 | false | 设为 true 后仅接受新签名令牌或 key 密码；迁移后建议启用 |
 | `dc` | 整数 | 否 | 0 | Telegram 数据中心 ID（1-5，0 表示自动选择，遇连接问题可指定）|
-| `workers` | 整数 | 否 | 1 | 并发下载协程数（1-4 推荐，过高易触发风控）|
+| `workers` | 整数 | 否 | 2 | 并发下载协程数，范围 1-4；过大的配置值会限制到 4 |
 | `maxSize` | 整数 | 否 | 32MB | 最大缓存大小（字节），同时约束头部/尾部分片缓存的上限分配 |
 | `channelID` | 整数 | 否 | 0 | 绑定的默认频道 ID（可在 API 中省略 `cid` 参数）|
 | `adminIDs` | 数组 | 否 | [] | 辅助管理员 ID 列表（拥有大部分权限，不含登录权限）|
@@ -83,7 +84,7 @@ TGFileBot 是一个 TeleBot 和 UserBot 深度结合的开源项目，旨在提�
 程序支持以下命令行参数：
 
 ```bash
-go run main.go [options]
+go run . [options]
 ```
 
 | 参数 | 说明 |
@@ -100,18 +101,23 @@ go run main.go [options]
 前往 [Releases](https://github.com/lm317379829/TGFileBot/releases) 页面，下载对应系统的可执行文件，解压后直接运行即可。
 
 **从源码编译运行**
+
+源码构建需要将包含本项目定制补丁的 `gogramN` 放在相邻目录（`../gogramN`）；模块名仍为 `github.com/xAmarnath/gogram`。不要使用旧 `gogram` 或无定制补丁的原版上游。
+
+CI：直接从 [lm317379829/gogramN](https://github.com/lm317379829/gogramN) 默认分支拉取最新代码到 `_deps/gogramN`，再通过本地 replace 使用该依赖，无需设置额外的库版本变量。依赖修复需要先推送到该仓库，才能被 CI 使用。
+
 ```bash
 # 安装依赖
 go mod tidy
 
 # 运行程序（默认配置文件位置: ./files/config.json）
-go run main.go
+go run .
 
 # 或指定文件目录和日志路径
-go run main.go -files ./files -log ./files/log.log
+go run . -files ./files -log ./files/log.log
 
 # 查看版本
-go run main.go -v
+go run . -v
 ```
 
 #### Docker 部署
@@ -506,31 +512,25 @@ docker stop tgfilebot
 
 ### 💡 身份鉴权说明
 
-若配置了 `password`，访问所有 HTTP 接口时须在 URL 中携带以下任意一种鉴权方式：
+配置 `password` 后，受保护接口接受 `key` 密码或 `hash` 令牌。状态和健康检查接口保持公开。
 
-| 鉴权方式 | URL 参数 | 说明 | 示例 |
-|:---|:---|:---|:---|
-| 明文密码 | `&key=yourpassword` | 直接传入配置中的 `password` 值 | `?key=mysecret123` |
-| 哈希密码 | `&hash=xxxxxx` | 更安全的方式，避免明文暴露密码 | `?hash=a1b2c3` |
+| 鉴权方式 | URL 参数 | 说明 |
+|:---|:---|:---|
+| 密码 | `key=yourpassword` | 配置中的访问密码 |
+| 签名令牌 | `hash=v2_...` | 新生成链接使用的 128 位 HMAC-SHA256 令牌，不包含密码 |
 
-**Hash 计算公式**: `md5(uid + password)` 的前 **6 位**十六进制字符串。这里的 `uid` 是离线计算 hash 时使用的用户 ID，不是 HTTP 请求参数。
+新令牌格式为 `v2_` 加 HMAC-SHA256 前 16 字节的十六进制字符串。签名消息为 `tgfilebot:hash:v2:{uid}`，密钥为配置的 `password`；`uid` 是已授权用户 ID，不是必填 HTTP 参数。修改密码会同时撤销新旧令牌。
 
-**计算示例**:
-```
-uid = 8888
-password = mypass
-md5("8888mypass") = "7c......" → 前 6 位为 "7c..."
-最终 URL 参数: ?hash=7c....
-```
+旧的六位 MD5 hash 默认继续接受以兼容已有链接。完成链接迁移后，将 `disableLegacyHash` 设为 `true` 并重启，关闭短 hash 鉴权。新部署建议直接启用此选项；保留旧 hash 期间仍存在 24 位短令牌的猜测风险。
 
-Python 示例代码：
 ```python
 import hashlib
+import hmac
 
 uid = 8888
 password = "mypass"
-hash_input = str(uid) + password
-hash_value = hashlib.md5(hash_input.encode()).hexdigest()[:6]
+message = f"tgfilebot:hash:v2:{uid}".encode()
+hash_value = "v2_" + hmac.new(password.encode(), message, hashlib.sha256).hexdigest()[:32]
 print(f"?hash={hash_value}")
 ```
 
@@ -612,7 +612,7 @@ White (白名单用户，仅基础访问)
 # 清理缓存和会话文件
 rm -f files/user.session files/user.cache
 # 重新运行程序
-go run main.go
+go run .
 ```
 
 ### 问题 2：下载速度慢或经常超时
@@ -668,7 +668,8 @@ docker restart tgfilebot
 import hashlib
 uid = 123456789
 password = "mypass"
-hash_val = hashlib.md5(f"{uid}{password}".encode()).hexdigest()[:6]
+import hmac
+hash_val = "v2_" + hmac.new(password.encode(), f"tgfilebot:hash:v2:{uid}".encode(), hashlib.sha256).hexdigest()[:32]
 # 使用: ?hash={hash_val}
 ```
 

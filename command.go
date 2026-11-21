@@ -12,11 +12,34 @@ import (
 	"strings"
 	"time"
 
-	"github.com/amarnathcjd/gogram/telegram"
+	"github.com/xAmarnath/gogram/telegram"
 )
 
 // handleBotCommand 是 Bot 的总消息分发入口，处理所有管理指令
 func handleBotCommand(m *telegram.NewMessage) error {
+	return dispatchBotCommand(m, sendMS, func(message *telegram.NewMessage) {
+		safeGo(func() {
+			time.Sleep(60 * time.Second)
+			if _, err := message.Delete(); err != nil {
+				log.Printf("删除命令消息失败: %+v", err)
+			}
+		})
+	})
+}
+
+// Keep Telegram sends and delayed deletion at the boundary so command decisions
+// and persisted changes can be verified without a live Telegram account.
+func dispatchBotCommand(m *telegram.NewMessage, sendMS func(*telegram.NewMessage, any, *telegram.SendOptions, ...int), scheduleDelete func(*telegram.NewMessage)) error {
+	if m == nil || m.Message == nil {
+		return nil
+	}
+	needAdmin := func(message *telegram.NewMessage) bool {
+		if infos.isAdmin(message.SenderID()) {
+			return true
+		}
+		sendMS(message, "你没有使用此命令的权限", nil, 60)
+		return false
+	}
 	// 该函数由 gogram 在收到消息时异步回调。goroutine panic 不受 http handler
 	// 的内置 recover 保护，若此处未恢复会直接终止整个进程（整个机器人退出）。
 	// 在入口恢复并记录栈，使单条消息/单条命令处理异常不拖垮服务。
@@ -54,19 +77,25 @@ func handleBotCommand(m *telegram.NewMessage) error {
 		}
 	}
 
-	// 以 / 开头的命令消息，1分钟后自动删除
-	if strings.HasPrefix(text, "/") {
-		safeGo(func() {
-			time.Sleep(60 * time.Second)
-			if _, err := m.Delete(); err != nil {
-				log.Printf("删除命令消息失败: %+v", err)
-			}
-		})
+	command, args := parseBotCommand(text, infos.BotUsername)
+	if strings.HasPrefix(text, "/") && command == "" {
+		return nil
+	}
+	if command != "" {
+		text = command
+		if args != "" {
+			text += " " + args
+		}
+	}
+
+	// Recognized command tokens retain the existing delayed deletion behavior.
+	if command != "" && scheduleDelete != nil {
+		scheduleDelete(m)
 	}
 
 	if m.Channel == nil {
-		switch {
-		case strings.HasPrefix(text, "/start"):
+		switch command {
+		case "/start":
 			if !infos.isWhite(m.SenderID()) {
 				sendMS(m, "你没有使用此机器人的权限", nil, 60)
 				return nil
@@ -89,8 +118,8 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			}
 			sendMS(m, src, nil)
 			return nil
-		case strings.HasPrefix(text, "/allow"):
-			if !infos.needAdmin(m) {
+		case "/allow":
+			if !needAdmin(m) {
 				return nil
 			}
 			whiteID, err := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(text, "/allow")), 10, 64)
@@ -117,25 +146,11 @@ func handleBotCommand(m *telegram.NewMessage) error {
 					return nil
 				}
 
-				infos.Mutex.Lock()
-				value := infos.IDs[whiteID]
-				value.IsWhite = true
-				infos.IDs[whiteID] = value
-				if hash := infos.calculateHash(whiteID); hash != "" {
-					// 6 位哈希存在碰撞可能: 若该哈希已被其他 UID 占用则跳过,
-					// 避免静默覆盖导致对方哈希不可用/冒用, 与 rebuildHashIndex 的碰撞策略保持一致
-					if owner, ok := infos.HashIndex[hash]; !ok || owner == whiteID {
-						infos.HashIndex[hash] = whiteID
-					} else {
-						log.Printf("哈希碰撞, 已跳过 %d 的反查索引 (哈希 %s 归属 %d)", whiteID, hash, owner)
-					}
-				}
-				infos.Mutex.Unlock()
 				sendMS(m, fmt.Sprintf("添加白名单成功: %d", whiteID), nil, 60)
 			}
 			return nil
-		case strings.HasPrefix(text, "/disallow"):
-			if !infos.needAdmin(m) {
+		case "/disallow":
+			if !needAdmin(m) {
 				return nil
 			}
 			content := strings.TrimSpace(strings.TrimPrefix(text, "/disallow"))
@@ -197,29 +212,9 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				return nil
 			}
 
-			infos.Mutex.Lock()
-			if value, ok := infos.IDs[whiteID]; ok {
-				if value.IsAdmin {
-					// 该 ID 同时也是管理员, 只清除白名单标记, 保留管理员权限（及其哈希索引）
-					value.IsWhite = false
-					infos.IDs[whiteID] = value
-				} else {
-					delete(infos.IDs, whiteID)
-					if hash := infos.calculateHash(whiteID); hash != "" {
-						// 6 位哈希存在碰撞可能: 仅当该哈希当前归属此 UID 时删除,
-						// 避免连带删除与他碰撞的其他用户的白名单哈希反查条目
-						if owner, ok := infos.HashIndex[hash]; !ok || owner == whiteID {
-							delete(infos.HashIndex, hash)
-						} else {
-							log.Printf("哈希碰撞, 跳过 %d 的反查索引删除 (哈希 %s 归属 %d)", whiteID, hash, owner)
-						}
-					}
-				}
-			}
-			infos.Mutex.Unlock()
 			sendMS(m, successMes, nil, 60)
 			return nil
-		case strings.HasPrefix(text, "/qr"):
+		case "/qr":
 			if m.SenderID() != conf.UserID {
 				sendMS(m, "你没有使用此命令的权限", nil, 60)
 				return nil
@@ -228,7 +223,7 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				sendMS(m, fmt.Sprintf("启动 QR 登录失败: %+v", err), nil, 60)
 			}
 			return nil
-		case strings.HasPrefix(text, "/phone"):
+		case "/phone":
 			if m.SenderID() != conf.UserID {
 				sendMS(m, "你没有使用此命令的权限", nil, 60)
 				return nil
@@ -245,7 +240,7 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				sendMS(m, fmt.Sprintf("启动 UserBot 失败: %+v", err), nil, 60)
 			}
 			return nil
-		case strings.HasPrefix(text, "/code"):
+		case "/code":
 			if m.SenderID() != conf.UserID {
 				sendMS(m, "你没有使用此命令的权限", nil, 60)
 				return nil
@@ -261,7 +256,7 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			}
 			sendMS(m, "提交验证码成功", nil, 60)
 			return nil
-		case strings.HasPrefix(text, "/pass") && !strings.HasPrefix(text, "/password"):
+		case "/pass":
 			if m.SenderID() != conf.UserID {
 				sendMS(m, "你没有使用此命令的权限", nil, 60)
 				return nil
@@ -277,8 +272,8 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			}
 			sendMS(m, "提交2FA密码成功", nil, 60)
 			return nil
-		case strings.HasPrefix(text, "/dc"):
-			if !infos.needAdmin(m) {
+		case "/dc":
+			if !needAdmin(m) {
 				return nil
 			}
 			content := strings.TrimSpace(strings.TrimPrefix(text, "/dc"))
@@ -306,16 +301,16 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			}
 			sendMS(m, fmt.Sprintf("DC已设置为: %d, 重启后生效", value), nil, 60)
 			return nil
-		case strings.HasPrefix(text, "/site"):
-			if !infos.needAdmin(m) {
+		case "/site":
+			if !needAdmin(m) {
 				return nil
 			}
 			content := strings.TrimSpace(strings.TrimPrefix(text, "/site"))
 			if content == "" {
-				sendMS(m, fmt.Sprintf("当前反代地址: %s", conf.Site), nil, 60)
+				sendMS(m, fmt.Sprintf("当前反代地址: %s", html.EscapeString(conf.Site)), nil, 60)
 				return nil
 			}
-			if !strings.HasPrefix(content, "http") {
+			if _, err := buildStreamLink(content, StreamLinkParams{}); err != nil {
 				sendMS(m, "反代地址格式错误", nil, 60)
 				return nil
 			}
@@ -324,10 +319,10 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				sendMS(m, fmt.Sprintf("保存配置失败: %+v", err), nil, 60)
 				return nil
 			}
-			sendMS(m, fmt.Sprintf("反代地址已设置为: %s", content), nil, 60)
+			sendMS(m, fmt.Sprintf("反代地址已设置为: %s", html.EscapeString(content)), nil, 60)
 			return nil
-		case strings.HasPrefix(text, "/size"):
-			if !infos.needAdmin(m) {
+		case "/size":
+			if !needAdmin(m) {
 				return nil
 			}
 			content := strings.TrimSpace(strings.TrimPrefix(text, "/size"))
@@ -336,7 +331,7 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				return nil
 			}
 			value, err := convertSize(content)
-			if err != nil {
+			if err != nil || value <= 0 {
 				sendMS(m, "最大缓存格式错误", nil, 60)
 				return nil
 			}
@@ -351,8 +346,8 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			}
 			sendMS(m, src, nil, 60)
 			return nil
-		case strings.HasPrefix(text, "/proxy"):
-			if !infos.needAdmin(m) {
+		case "/proxy":
+			if !needAdmin(m) {
 				return nil
 			}
 			content := strings.TrimSpace(strings.TrimPrefix(text, "/proxy"))
@@ -361,7 +356,7 @@ func handleBotCommand(m *telegram.NewMessage) error {
 					sendMS(m, "当前未设置代理", nil, 60)
 					return nil
 				} else {
-					sendMS(m, fmt.Sprintf("当前代理: %s", conf.Proxy), nil, 60)
+					sendMS(m, fmt.Sprintf("当前代理: %s", html.EscapeString(conf.Proxy)), nil, 60)
 					return nil
 				}
 			}
@@ -377,10 +372,10 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				sendMS(m, fmt.Sprintf("保存配置失败: %+v", err), nil, 60)
 				return nil
 			}
-			sendMS(m, fmt.Sprintf("代理已设置为: %s", content), nil, 60)
+			sendMS(m, fmt.Sprintf("代理已设置为: %s", html.EscapeString(content)), nil, 60)
 			return nil
-		case strings.HasPrefix(text, "/password"):
-			if !infos.needAdmin(m) {
+		case "/password":
+			if !needAdmin(m) {
 				return nil
 			}
 			content := strings.TrimSpace(strings.TrimPrefix(text, "/password"))
@@ -393,14 +388,10 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				sendMS(m, fmt.Sprintf("保存配置失败: %+v", err), nil, 60)
 				return nil
 			}
-			// 密码变化会改变每个 uid 对应的哈希, 需要整体重建反查表
-			infos.Mutex.Lock()
-			infos.rebuildHashIndex()
-			infos.Mutex.Unlock()
 			sendMS(m, "密码已更新", nil, 60)
 			return nil
-		case strings.HasPrefix(text, "/channel"):
-			if !infos.needAdmin(m) {
+		case "/channel":
+			if !needAdmin(m) {
 				return nil
 			}
 			content := strings.TrimSpace(strings.TrimPrefix(text, "/channel"))
@@ -423,8 +414,8 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			}
 			sendMS(m, fmt.Sprintf("频道ID已设置为: %d", value), nil, 60)
 			return nil
-		case strings.HasPrefix(text, "/workers"):
-			if !infos.needAdmin(m) {
+		case "/workers":
+			if !needAdmin(m) {
 				return nil
 			}
 			content := strings.TrimSpace(strings.TrimPrefix(text, "/workers"))
@@ -437,8 +428,8 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				sendMS(m, "并发数必须为数字", nil, 60)
 				return nil
 			}
-			if num <= 0 {
-				sendMS(m, "并发数必须大于 0", nil, 60)
+			if num < 1 || num > 4 {
+				sendMS(m, "并发数必须在 1-4 之间", nil, 60)
 				return nil
 			}
 			if err := infos.refreshConf(func(c *Conf) { c.Workers = num }); err != nil {
@@ -447,13 +438,10 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				return nil
 			}
 			src := fmt.Sprintf("并发数已设置为: %d", num)
-			if num > 4 {
-				src += ", 当前并发数较大, 容易引起下载失败甚至封号, 请谨慎设置"
-			}
 			sendMS(m, src, nil, 60)
 			return nil
-		case strings.HasPrefix(text, "/check"):
-			if !infos.needAdmin(m) {
+		case "/check":
+			if !needAdmin(m) {
 				return nil
 			}
 			content := strings.TrimSpace(strings.TrimPrefix(text, "/check"))
@@ -479,8 +467,8 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				sendMS(m, values.String(), nil, 60)
 			}
 			return nil
-		case strings.HasPrefix(text, "/add") && !strings.HasPrefix(text, "/addrule"):
-			if !infos.needAdmin(m) {
+		case "/add":
+			if !needAdmin(m) {
 				return nil
 			}
 			channel := strings.TrimSpace(strings.TrimPrefix(text, "/add"))
@@ -503,13 +491,13 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			}
 
 			if !added {
-				sendMS(m, fmt.Sprintf("频道 %s 已存在", channel), nil, 60)
+				sendMS(m, fmt.Sprintf("频道 %s 已存在", html.EscapeString(channel)), nil, 60)
 				return nil
 			}
-			sendMS(m, fmt.Sprintf("添加频道成功: %s", channel), nil, 60)
+			sendMS(m, fmt.Sprintf("添加频道成功: %s", html.EscapeString(channel)), nil, 60)
 			return nil
-		case strings.HasPrefix(text, "/del") && !strings.HasPrefix(text, "/delrule"):
-			if !infos.needAdmin(m) {
+		case "/del":
+			if !needAdmin(m) {
 				return nil
 			}
 			content := strings.TrimSpace(strings.TrimPrefix(text, "/del"))
@@ -533,12 +521,12 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				if byIndex {
 					if indexErr == nil && index >= 0 && index < len(c.Channels) {
 						removed = c.Channels[index]
-						successMes = fmt.Sprintf("按索引移除频道成功: %s", removed)
+						successMes = fmt.Sprintf("按索引移除频道成功: %s", html.EscapeString(removed))
 						found = true
 					}
 				} else if slices.Contains(c.Channels, channelByName) {
 					removed = channelByName
-					successMes = fmt.Sprintf("按内容移除频道成功: %s", channelByName)
+					successMes = fmt.Sprintf("按内容移除频道成功: %s", html.EscapeString(channelByName))
 					found = true
 				}
 				if found {
@@ -560,14 +548,14 @@ func handleBotCommand(m *telegram.NewMessage) error {
 						sendMS(m, fmt.Sprintf("索引 #%d 超出频道列表范围", index), nil, 60)
 					}
 				} else {
-					sendMS(m, fmt.Sprintf("频道 %s 不在搜索列表中", channelByName), nil, 60)
+					sendMS(m, fmt.Sprintf("频道 %s 不在搜索列表中", html.EscapeString(channelByName)), nil, 60)
 				}
 				return nil
 			}
 			sendMS(m, successMes, nil, 60)
 			return nil
-		case strings.HasPrefix(text, "/list"):
-			if !infos.needAdmin(m) {
+		case "/list":
+			if !needAdmin(m) {
 				return nil
 			}
 			content := strings.TrimSpace(strings.TrimPrefix(text, "/list"))
@@ -622,8 +610,8 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				sendMS(m, "类别错误", nil, 60)
 			}
 			return nil
-		case strings.HasPrefix(text, "/port"):
-			if !infos.needAdmin(m) {
+		case "/port":
+			if !needAdmin(m) {
 				return nil
 			}
 			content := strings.TrimSpace(strings.TrimPrefix(text, "/port"))
@@ -647,8 +635,8 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			}
 			sendMS(m, fmt.Sprintf("端口已设置为: %d, 重启后生效", value), nil, 60)
 			return nil
-		case strings.HasPrefix(text, "/info"):
-			if !infos.needAdmin(m) {
+		case "/info":
+			if !needAdmin(m) {
 				return nil
 			}
 
@@ -662,6 +650,10 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				content = src
 			}
 
+			if num <= 0 {
+				sendMS(m, "行数必须大于 0", nil, 60)
+				return nil
+			}
 			if infos.FilePath == "" {
 				sendMS(m, "暂未开启日志记录", nil, 60)
 				return nil
@@ -678,29 +670,12 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				return nil
 			}
 
-			const maxCount = 4000
-			var values strings.Builder
-			values.WriteString(fmt.Sprintf("<b>📜 系统日志 (最后 %d 行)</b>\n\n", len(lines)))
-			values.WriteString("<pre>")
-
-			for _, line := range lines {
-				line = html.EscapeString(line) + "\n"
-				if values.Len()+len(line)+len("</pre>") > maxCount {
-					values.WriteString("</pre>")
-					sendMS(m, values.String(), nil)
-					values.Reset()
-					values.WriteString("<pre>")
-				}
-				values.WriteString(line)
-			}
-
-			if values.Len() > len("<pre>") {
-				values.WriteString("</pre>")
-				sendMS(m, values.String(), nil)
+			for _, page := range logReplyPages(lines) {
+				sendMS(m, page, &telegram.SendOptions{ParseMode: "html"})
 			}
 			return nil
-		case strings.HasPrefix(text, "/addrule"):
-			if !infos.needAdmin(m) {
+		case "/addrule":
+			if !needAdmin(m) {
 				return nil
 			}
 			rule := strings.TrimSpace(strings.TrimPrefix(text, "/addrule"))
@@ -732,8 +707,8 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			infos.buildRexRules()
 			sendMS(m, "添加正则规则成功", nil, 60)
 			return nil
-		case strings.HasPrefix(text, "/delrule"):
-			if !infos.needAdmin(m) {
+		case "/delrule":
+			if !needAdmin(m) {
 				return nil
 			}
 			content := strings.TrimSpace(strings.TrimPrefix(text, "/delrule"))
@@ -756,7 +731,7 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				if byIndex {
 					if indexErr == nil && index >= 0 && index < len(c.Rules) {
 						removed = c.Rules[index]
-						successMes = fmt.Sprintf("按索引移除规则成功: %s", removed)
+						successMes = fmt.Sprintf("按索引移除规则成功: %s", html.EscapeString(removed))
 						found = true
 					}
 				} else if slices.Contains(c.Rules, content) {
@@ -787,6 +762,9 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			sendMS(m, successMes, nil, 60)
 			return nil
 		default:
+			if command != "" {
+				return nil
+			}
 			if !infos.isWhite(m.SenderID()) && m.SenderID() != 0 {
 				sendMS(m, "你没有使用此机器人的权限", nil, 60)
 				return nil
@@ -838,7 +816,7 @@ func handleMess(m *telegram.NewMessage) error {
 	}
 
 	// 匹配格式如：t.me/c/12345/678 或 t.me/username/678
-	matches := teleLinkRe.FindAllStringSubmatch(src, -1)
+	matches := findTelegramLinks(src)
 
 	if len(matches) == 0 {
 		return nil
@@ -888,6 +866,13 @@ func handleMess(m *telegram.NewMessage) error {
 
 // sendLink 发送美化后的下载链接消息
 func sendLink(m *telegram.NewMessage, links []string) error {
+	return sendLinkReplies(links, func(text string, options *telegram.SendOptions) error {
+		_, err := m.Reply(text, options)
+		return err
+	})
+}
+
+func sendLinkReplies(links []string, reply func(string, *telegram.SendOptions) error) error {
 	if len(links) == 0 {
 		return nil
 	}
@@ -895,11 +880,14 @@ func sendLink(m *telegram.NewMessage, links []string) error {
 	if len(links) == 1 {
 		link := links[0]
 		text := fmt.Sprintf("<b>🔗 链接提取成功</b>\n\n<code>%s</code>\n\n👆 <i>上方链接复制, 下方按钮下载</i> 👇", html.EscapeString(link))
+		if len(text) > maxReplyHTMLBytes {
+			return errors.New("单个链接过长，无法放入 Telegram 消息")
+		}
 		markup := telegram.NewKeyboard().AddRow(
 			telegram.Button.URL("🚀 直接下载", fmt.Sprintf("%s&download=true", link)),
 		).Build()
 
-		_, err := m.Reply(text, &telegram.SendOptions{
+		err := reply(text, &telegram.SendOptions{
 			ParseMode:   "html",
 			ReplyMarkup: markup,
 		})
@@ -910,20 +898,17 @@ func sendLink(m *telegram.NewMessage, links []string) error {
 		return err
 	}
 
-	var text strings.Builder
-	text.WriteString(fmt.Sprintf("<b>🔗 成功提取 %d 个链接</b>\n\n", len(links)))
-	for num, link := range links {
-		text.WriteString(fmt.Sprintf("<b>%d.</b> <code>%s</code>\n", num+1, html.EscapeString(link)))
-		text.WriteString(fmt.Sprintf("👉 <a href=\"%s&download=true\">点击直接下载</a>\n\n", html.EscapeString(link)))
-	}
-
-	_, err := m.Reply(text.String(), &telegram.SendOptions{
-		ParseMode: "html",
-	})
+	pages, err := linkReplyPages(links)
 	if err != nil {
-		log.Printf("发送合并下载链接失败: %+v", err)
+		return err
 	}
-	return err
+	for _, page := range pages {
+		if err := reply(page, &telegram.SendOptions{ParseMode: "html"}); err != nil {
+			log.Printf("发送合并下载链接失败: %+v", err)
+			return err
+		}
+	}
+	return nil
 }
 
 // sendMS 统一发送消息，支持回复或主动推送给管理员，可设置自动删除延时

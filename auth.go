@@ -1,68 +1,70 @@
 package main
 
 import (
+	"crypto/hmac"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
 	"sort"
 
-	"github.com/amarnathcjd/gogram/telegram"
+	"github.com/xAmarnath/gogram/telegram"
 )
 
 // buildIDs 根据配置重建 IDs 以支持 O(1) 权限查询
 func (infos *Infos) buildIDs() {
-	conf := infos.Conf.Load()
-
 	infos.Mutex.Lock()
 	defer infos.Mutex.Unlock()
+	infos.buildIDsLocked(infos.Conf.Load())
+}
 
-	// 配置里列出的 ID 无论是否已存在于 IDs 中, 都应补齐配置规定的权限标志,
-	// 而非仅新增条目：防止已有条目（如会话中途标记过）缺失配置要求的管理员/白名单位
-	setAdminWhite := func(id int64) {
-		value := infos.IDs[id]
-		value.IsAdmin = true
-		value.IsWhite = true
-		infos.IDs[id] = value
+// buildIDsLocked derives the complete access state from one configuration.
+// Callers hold Mutex, including while publishing a replacement configuration.
+func (infos *Infos) buildIDsLocked(conf *Conf) {
+	infos.IDs = make(map[int64]ID, len(conf.AdminIDs)+len(conf.WhiteIDs)+1)
+	setAdmin := func(id int64) {
+		if id != 0 {
+			infos.IDs[id] = ID{IsAdmin: true, IsWhite: true}
+		}
 	}
-	setWhite := func(id int64) {
-		value := infos.IDs[id]
-		value.IsWhite = true
-		infos.IDs[id] = value
-	}
-
-	setAdminWhite(conf.UserID)
-
-	// 检查AdminIDs是否在IDs中
+	setAdmin(conf.UserID)
 	for _, id := range conf.AdminIDs {
-		setAdminWhite(id)
+		setAdmin(id)
 	}
-
-	// 检查WhiteIDs是否在IDs中
 	for _, id := range conf.WhiteIDs {
-		setWhite(id)
+		if id != 0 {
+			value := infos.IDs[id]
+			value.IsWhite = true
+			infos.IDs[id] = value
+		}
 	}
-
 	infos.rebuildHashIndex()
 }
 
 // rebuildHashIndex 根据当前 IDs 重建 hash -> uid 反查表, 调用方必须已持有 infos.Mutex 写锁。
-// 碰撞时保留较小 UID（遍历顺序确定, 保证跨重启结果一致）; 被碰撞者的链接鉴权
-// 走 calculateHash 直接计算, 不受反查表缺失影响
+// 碰撞时保留较小 UID（遍历顺序确定, 保证跨重启结果一致）。
 func (infos *Infos) rebuildHashIndex() {
-	index := make(map[string]int64, len(infos.IDs))
+	conf := infos.Conf.Load()
+	index := make(map[string]int64, 2*len(infos.IDs))
 	uids := make([]int64, 0, len(infos.IDs))
 	for uid := range infos.IDs {
 		uids = append(uids, uid)
 	}
 	sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
 	for _, uid := range uids {
-		if hash := infos.calculateHash(uid); hash != "" {
-			if owner, ok := index[hash]; ok && owner != uid {
+		hashes := []string{signedHash(uid, conf.Password)}
+		if !conf.DisableLegacyHash {
+			hashes = append(hashes, legacyHash(uid, conf.Password))
+		}
+		for _, hash := range hashes {
+			if hash == "" {
 				continue
 			}
-			index[hash] = uid
+			if _, exists := index[hash]; !exists {
+				index[hash] = uid
+			}
 		}
 	}
 	infos.HashIndex = index
@@ -95,14 +97,26 @@ func (infos *Infos) isWhite(id int64) bool {
 	return false
 }
 
-// calculateHash 为指定用户 ID 生成 6 位 MD5 哈希, 用于鉴权
+// calculateHash signs new links with a versioned 128-bit HMAC token.
 func (infos *Infos) calculateHash(userID int64) string {
-	password := infos.Conf.Load().Password
+	return signedHash(userID, infos.Conf.Load().Password)
+}
+
+func signedHash(userID int64, password string) string {
 	if password == "" {
 		return ""
 	}
-	res := fmt.Sprintf("%d%s", userID, password)
-	src := md5.Sum([]byte(res))
+	mac := hmac.New(sha256.New, []byte(password))
+	fmt.Fprintf(mac, "tgfilebot:hash:v2:%d", userID)
+	return "v2_" + hex.EncodeToString(mac.Sum(nil)[:16])
+}
+
+// legacyHash is accepted only while the explicit migration switch permits it.
+func legacyHash(userID int64, password string) string {
+	if password == "" {
+		return ""
+	}
+	src := md5.Sum([]byte(fmt.Sprintf("%d%s", userID, password)))
 	return hex.EncodeToString(src[:])[:6]
 }
 
@@ -119,6 +133,8 @@ func (infos *Infos) checkHash(hash string) int64 {
 
 // checkPass 验证 HTTP 请求中的访问密码或哈希
 func checkPass(params url.Values) error {
+	infos.Mutex.RLock()
+	defer infos.Mutex.RUnlock()
 	confPassword := infos.Conf.Load().Password
 	if confPassword != "" {
 		hash := params.Get("hash") // 基于用户 ID 的哈希校验
@@ -129,22 +145,10 @@ func checkPass(params url.Values) error {
 				return errors.New("无效的密码")
 			}
 		case hash != "":
-			uid := infos.checkHash(hash)
+			uid := infos.HashIndex[hash]
 			if uid == 0 {
 				return errors.New("无效的哈希")
 			}
-			/*
-				value := params.Get("uid")
-				uid, err := strconv.ParseInt(value, 10, 64)
-				if err == nil && uid != 0 {
-					if hash != infos.calculateHash(uid) {
-						return errors.New("无效的哈希密码")
-					}
-				} else {
-					log.Printf("UID无效: %s", value)
-					return errors.New("无效的UID")
-				}
-			*/
 		default:
 			return errors.New("您没有权限访问此链接")
 		}

@@ -45,3 +45,9 @@ files.zip
 IDEA.md
 *test.go
 .idea
+
+# Keep tests and generated review documents local.
+*_test.go
+test/
+tests/
+docs/

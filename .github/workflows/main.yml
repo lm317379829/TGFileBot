@@ -2,11 +2,14 @@ name: build TGFileBot
 
 on:
   push:
-    branches: [ main ]
+    branches: [main, new]
   pull_request:
-    branches: [ main ]
+    branches: [main, new]
   repository_dispatch:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -14,43 +17,99 @@ concurrency:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        platform: [ubuntu-latest]
-        go-version: [ '1.26.1' ]
-    name: Build
-    runs-on: ${{ matrix.platform }}
+    name: Build and verify
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: 设置 GO 环境
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ matrix.go-version }}
+          go-version: '1.26.1'
 
-      - name: 检出代码
+      - name: 检出 gogramN
         uses: actions/checkout@v4
-        
+        with:
+          repository: lm317379829/gogramN
+          path: _deps/gogramN
+          persist-credentials: false
+
+      - name: 更新依赖并验证
+        run: |
+          go mod edit -replace github.com/xAmarnath/gogram=./_deps/gogramN
+          go mod tidy
+          go test -race ./...
+          go vet ./...
+          (cd _deps/gogramN && go test -race ./... && go vet ./...)
+
+      - name: 确定程序版本
+        id: version
+        env:
+          BUILD_SHA: ${{ github.sha }}
+        run: |
+          build_version="$(go run . -version)+${BUILD_SHA:0:12}"
+          printf 'version=%s\n' "$build_version" >> "$GITHUB_OUTPUT"
+
+      - name: 编译
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          GOOS=linux GOARCH=386 CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$BUILD_VERSION" -tags netgo -o TGFileBot-linux-386
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$BUILD_VERSION" -tags netgo -o TGFileBot-linux-amd64
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$BUILD_VERSION" -tags netgo -o TGFileBot-linux-arm64
+          GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$BUILD_VERSION" -tags netgo -o TGFileBot-freebsd-amd64
+
+      - name: 保存已验证构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: tgfilebot-binaries
+          path: TGFileBot-*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish verified release
+    needs: build
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/new')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    concurrency:
+      group: tgfilebot-release
+      cancel-in-progress: false
+    steps:
+      - name: 检出发布文件
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: 取得已验证构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: tgfilebot-binaries
+          path: .
+
       - name: 检查、推送新的标签
         id: bump
         uses: anothrNick/github-tag-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WITH_V: false  # 不生成带v前缀的标签，如1.0.0而非v1.0.0
-          
-      - name: 更新依赖
-        env:
-          GOPRIVATE: github.com/lm317379829/gogram
-        run: |
-          go mod edit -dropreplace github.com/amarnathcjd/gogram
-          go mod edit -replace github.com/amarnathcjd/gogram=github.com/lm317379829/gogram@latest
-          go mod tidy
+          WITH_V: false
+          RELEASE_BRANCHES: main,new
+          DEFAULT_BRANCH: ${{ github.ref_name }}
 
-      - name: 编译
-        run: |
-          GOOS=linux GOARCH=386 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -installsuffix netgo -o TGFileBot-linux-386
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -installsuffix netgo -o TGFileBot-linux-amd64
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -installsuffix netgo -o TGFileBot-linux-arm64
-          GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -installsuffix netgo -o TGFileBot-freebsd-amd64
-          echo ${{ steps.bump.outputs.new_tag }} >> TGFileBot-version
+      - name: 写入版本说明
+        env:
+          RELEASE_TAG: ${{ steps.bump.outputs.new_tag }}
+        run: printf '%s\n' "$RELEASE_TAG" > TGFileBot-version
 
       - name: 上传至 Releases
         uses: softprops/action-gh-release@v2
@@ -58,8 +117,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ steps.bump.outputs.new_tag }}
-          files: ${{ github.workspace }}/TGFileBot-*
-      
+          files: TGFileBot-*
+
       - name: 设置 QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -67,28 +126,26 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: 登录 Docker Hub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
       - name: 提取元数据
         id: meta
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v5
         with:
           images: lm317379829/tgfilebot
           tags: |
             type=raw,value=${{ steps.bump.outputs.new_tag }}
             type=raw,value=latest
-     
-      # 构建并推送Docker镜像
+
       - name: 构建并推送 Docker 镜像
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
